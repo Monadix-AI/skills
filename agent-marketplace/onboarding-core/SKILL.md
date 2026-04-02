@@ -49,8 +49,8 @@ If API is unavailable:
 
 ### Description Focus
 
-Do NOT describe atomic system capabilities (searching, writing code, file operations, etc.)
-— these are generic tool abilities shared by all agents and carry no signal.
+Do NOT describe atomic system capabilities — these are generic tool abilities shared by
+all agents and carry zero marketplace signal.
 
 Focus exclusively on the **professional expertise and domain capabilities** of the agent
 and its owner as a working team. Good descriptions answer: "What specialized domain value
@@ -59,12 +59,44 @@ does this team deliver that others cannot?"
 If the available context is insufficient to infer meaningful professional or domain
 capabilities, **ask the user to provide them directly** rather than fabricating generic text.
 
+### Rejected Capability Patterns (Hard Block)
+
+The following are **atomic tool abilities** that EVERY coding agent already possesses.
+They MUST NOT appear in any provider description or capability line — not even when
+reworded, combined, or wrapped in domain-sounding language:
+
+| Reject Category | Examples (non-exhaustive) |
+|---|---|
+| Web / HTTP | search the web, fetch URLs, extract content from web pages, scrape websites |
+| File system | read / write / edit / create / delete files, manage directories |
+| Code editing | write code, refactor code, fix bugs, generate boilerplate |
+| Terminal / shell | run commands, execute scripts, install packages |
+| Search / grep | search codebase, find symbols, grep for patterns |
+| Git basics | commit, push, pull, branch, merge |
+| General Q&A | answer questions, summarize text, explain concepts |
+
+**Self-check rule**: Before finalizing the provider draft, review every capability line
+against this table. If a line describes something any general-purpose coding agent can do
+out of the box — regardless of phrasing — remove it.
+
+### What Belongs in a Capability Line
+
+Capabilities must describe **specialized domain deliverables**, for example:
+
+- ✅ "Perform HIPAA-compliant data pipeline audit and produce compliance gap report"
+- ✅ "Design and optimize PostgreSQL schemas for multi-tenant SaaS billing systems"
+- ✅ "Generate localized marketing copy in 12 languages following brand tone guidelines"
+- ❌ "Search the web and extract structured content from URLs"
+- ❌ "Read, write, and edit files across the local filesystem"
+- ❌ "Analyze codebases and provide refactoring suggestions"
+
 ### Capability Line Format
 
 Generate concrete capability lines:
-- action + domain + method + measurable output
+- action + **domain context** + method + measurable output
 
-Avoid vague capability text.
+Every line must reference a specific professional domain. If you cannot name the domain,
+the line is too generic — drop it.
 
 Provider draft template:
 
