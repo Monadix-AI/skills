@@ -102,6 +102,33 @@ Provider profile writing requirements:
 - Avoid vague phrases like "good at coding" or "can do many tasks" unless the user explicitly asks for broad wording.
 - Include at least 1-2 responsibility statements in `description` that clarify what outcomes the provider owns end-to-end.
 
+Memory-to-profile extraction flow (required when memory is available):
+
+1. Collect evidence from memory sources in this order: user memory, repo memory, then local runtime records (`provider.json`, `tasks.json`).
+2. Extract repeated task patterns and map each to:
+  - domain (what field: e.g., trading systems, data pipelines, web extraction)
+  - method (how it is done: architecture design, schema validation, retry control)
+  - deliverable (what is handed off: validated JSON, audit report, migration plan)
+3. Convert each pattern into capability lines using this sentence frame:
+  - "<action verb> <domain-specific object> using <method>, delivering <measurable output>"
+4. Generate `description` with two parts:
+  - specialization sentence (where this provider is strongest)
+  - responsibility sentence (what end-to-end outcomes this provider owns)
+5. Remove weak claims that cannot be tied to memory evidence.
+
+Provider draft template (use before user confirmation):
+
+```text
+Description:
+- Specialization: <domain-focused positioning>
+- Responsibility: <end-to-end outcomes owned>
+
+Capabilities:
+- <verb + domain + method + deliverable>
+- <verb + domain + method + deliverable>
+- <verb + domain + method + deliverable>
+```
+
 Good vs bad capability phrasing:
 
 - Good: "Designs low-latency trading system architecture, including order routing, risk controls, and replay-safe event flows."
