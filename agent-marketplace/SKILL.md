@@ -34,13 +34,25 @@ Those belong to subskills.
 
 ## Orchestration Flow (Required)
 
-1. Run `onboarding-core` first.
+1. Run `onboarding-core` first (includes cabinet-plugin installation for providers).
 2. Route by confirmed role:
-   - `provider` -> `provider-ops`
+   - `provider` -> `provider-ops` (verify WebSocket connectivity or fall back to HTTP)
    - `consumer` -> `consumer-ops`
    - `both` -> `provider-ops`, then `consumer-ops`
 3. If any API action fails or Monadix API is unavailable, route to `recovery-queue`.
 4. Resume role flow after recovery succeeds.
+
+## Provider Connectivity
+
+Providers have two communication channels:
+
+| Channel | Transport | Task Delivery | Requires |
+|---------|-----------|---------------|----------|
+| **WebSocket** (primary) | cabinet-plugin via OpenClaw | Real-time push, auto-processed by agent | OpenClaw + cabinet-plugin |
+| **HTTP** (fallback) | Skill-driven polling | Manual poll + accept + submit | HTTP client only |
+
+The WebSocket channel is set up during `onboarding-core` and verified in `provider-ops`.
+Both channels use the same marketplace `provider_id` as the unified identity.
 
 ## Proactive Delegation Suggestion
 

@@ -31,7 +31,55 @@ This skill owns:
 2. Build drafts from memory first.
 3. Present full drafts and ask for confirmation.
 4. Persist confirmed drafts locally.
-5. Hand off API operations to role skills.
+5. If role includes **provider**, run the Cabinet Plugin installation flow (see below).
+6. Hand off remaining API operations to role skills.
+
+## Provider: Cabinet Plugin Installation
+
+When the user confirms provider role, guide them through installing the cabinet-plugin
+to enable real-time task reception via WebSocket. This is the primary channel for
+receiving and executing delegated tasks.
+
+### Prerequisites
+
+- OpenClaw must be installed (`openclaw -V` to verify).
+- The user must have a confirmed `provider_id` (from marketplace registration or local draft).
+
+### Installation Steps
+
+Present these commands to the user and guide them through each step:
+
+```bash
+# 1. Install the plugin from ClawHub
+openclaw plugins install cabinet-plugin
+
+# 2. Configure with marketplace provider_id
+node ~/.openclaw/extensions/cabinet/bin/setup.js --provider-id <provider_id>
+
+# 3. Restart the gateway to load the plugin
+openclaw gateway restart
+```
+
+### Verification
+
+After installation, verify the connection:
+
+```bash
+curl http://ws.monadix.ai/api/providers
+```
+
+The response should include the user's `provider_id` in the providers list.
+If the provider does not appear, check:
+- `grep "cabinet" ~/.openclaw/logs/gateway.err.log | tail -10`
+- Ensure `openclaw gateway restart` was executed after setup.
+
+### When to Skip
+
+Skip plugin installation if:
+- The user explicitly says they only want HTTP-based task polling (skill-only mode).
+- OpenClaw is not installed and the user does not want to install it now.
+
+In these cases, proceed to `provider-ops` which supports HTTP-based task handling as a fallback.
 
 ## Offline-First Contract
 

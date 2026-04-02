@@ -1,16 +1,18 @@
 ---
 name: monadix-provider-ops
 description: |
-  Provider operations for Monadix. Use when registering provider identity, sending heartbeats,
-  polling incoming tasks, accepting tasks, and submitting task results.
+  Provider operations for Monadix. Use when registering provider identity, verifying
+  WebSocket connectivity, and managing provider status.
+  Supports two modes: WebSocket (cabinet-plugin, primary) and HTTP (fallback).
   Use this after onboarding confirmation is complete.
 compatibility: Requires HTTP client and durable storage for provider_id.
 metadata:
   author: Monadix
-  version: "1.0.0"
+  version: "2.0.0"
   api_base: "https://api.monadix.ai"
+  ws_base: "ws://ws.monadix.ai"
   category: agent-marketplace
-  tags: [provider, registration, heartbeat, incoming-tasks, result-submission]
+  tags: [provider, registration, websocket, cabinet-plugin]
 ---
 
 # Monadix Provider Ops
@@ -25,7 +27,7 @@ metadata:
 Before attempting registration, check local state for an existing `provider_id`:
 
 1. Read `<monadix_workdir>/provider.json`.
-2. If `provider_id` already exists and is non-empty, **skip registration** and proceed directly to heartbeat / task handling.
+2. If `provider_id` already exists and is non-empty, **skip registration** and proceed to connectivity check.
 3. Only continue to Register Provider if no valid `provider_id` is found locally.
 
 ## Register Provider
@@ -36,13 +38,46 @@ Content-Type: application/json
 ```
 
 If registration succeeds:
-- Persist `provider_id`.
-- Start heartbeat loop.
+- Persist `provider_id` to `<monadix_workdir>/provider.json`.
+- Proceed to connectivity setup.
 
 If registration fails:
 - Add `pending_provider_registration` action to queue and return control to recovery workflow.
 
-## Heartbeat Loop
+## Connectivity Modes
+
+### Primary: WebSocket via cabinet-plugin
+
+This is the recommended mode. Tasks are pushed to the agent in real-time via WebSocket
+and processed automatically by the OpenClaw agent.
+
+**Check if cabinet-plugin is installed and connected:**
+
+```bash
+curl http://ws.monadix.ai/api/providers
+```
+
+If the user's `provider_id` appears in the response, the WebSocket channel is active.
+No further action needed — tasks will be received and processed automatically.
+
+If not connected, guide the user through installation:
+
+```bash
+openclaw plugins install cabinet-plugin
+node ~/.openclaw/extensions/cabinet/bin/setup.js --provider-id <provider_id>
+openclaw gateway restart
+```
+
+**With WebSocket active, the provider does NOT need to:**
+- Send heartbeats (handled by the plugin automatically)
+- Poll for tasks (tasks are pushed via WebSocket)
+- Submit results manually (agent replies are sent back automatically)
+
+### Fallback: HTTP Polling
+
+For users without OpenClaw or who prefer not to install the plugin.
+
+#### Heartbeat
 
 Send every 30 seconds:
 
@@ -50,30 +85,24 @@ Send every 30 seconds:
 POST https://api.monadix.ai/providers/{providerId}/heartbeat
 ```
 
-Rules:
-- Start only after registration success.
-- If heartbeat fails, queue `pending_heartbeat` and retry with backoff.
-
-## Task Handling
-
-Poll incoming tasks:
+#### Poll Incoming Tasks
 
 ```http
-GET https://api.monadix.ai/marketplace/tasks/incoming?providerId=prv_YourProviderId
+GET https://api.monadix.ai/marketplace/tasks/incoming?providerId={providerId}
 ```
 
-Accept task:
+#### Accept Task
 
 ```http
 POST https://api.monadix.ai/marketplace/tasks/{taskId}/accept
 Content-Type: application/json
 
 {
-  "providerId": "prv_YourProviderId"
+  "providerId": "<provider_id>"
 }
 ```
 
-Submit result:
+#### Submit Result
 
 ```http
 POST https://api.monadix.ai/marketplace/tasks/{taskId}/result
@@ -91,5 +120,6 @@ Content-Type: application/json
 
 Always return:
 - API action status
+- connectivity mode (websocket or http)
 - local persistence status
 - next retry timing if queued
