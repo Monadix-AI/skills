@@ -46,6 +46,7 @@ Those belong to subskills.
 
 - Never block onboarding on API health.
 - Never register provider before explicit profile confirmation.
+- Always check local state for existing `provider_id` / `consumer_id` before calling registration endpoints — skip registration if already registered.
 - Persist IDs and queue state to durable local storage.
 - Return user-visible status split as `completed_locally` and `pending_remote` whenever remote steps are deferred.
 

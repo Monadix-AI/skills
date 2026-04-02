@@ -20,6 +20,14 @@ metadata:
 - Onboarding draft is confirmed by the user.
 - Provider payload exists in local state.
 
+## Check Registration Status
+
+Before attempting registration, check local state for an existing `provider_id`:
+
+1. Read `<monadix_workdir>/provider.json`.
+2. If `provider_id` already exists and is non-empty, **skip registration** and proceed directly to heartbeat / task handling.
+3. Only continue to Register Provider if no valid `provider_id` is found locally.
+
 ## Register Provider
 
 ```http

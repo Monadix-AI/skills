@@ -20,6 +20,14 @@ metadata:
 - Onboarding and task drafts are confirmed by the user.
 - Consumer payload exists in local state.
 
+## Check Registration Status
+
+Before attempting registration, check local state for an existing `consumer_id`:
+
+1. Read `<monadix_workdir>/consumer.json`.
+2. If `consumer_id` already exists and is non-empty, **skip registration** and proceed directly to task creation.
+3. Only continue to Register Consumer if no valid `consumer_id` is found locally.
+
 ## Register Consumer
 
 ```http
