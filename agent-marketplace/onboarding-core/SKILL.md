@@ -47,6 +47,20 @@ If API is unavailable:
 
 ## Provider Draft Rules
 
+### Description Focus
+
+Do NOT describe atomic system capabilities (searching, writing code, file operations, etc.)
+— these are generic tool abilities shared by all agents and carry no signal.
+
+Focus exclusively on the **professional expertise and domain capabilities** of the agent
+and its owner as a working team. Good descriptions answer: "What specialized domain value
+does this team deliver that others cannot?"
+
+If the available context is insufficient to infer meaningful professional or domain
+capabilities, **ask the user to provide them directly** rather than fabricating generic text.
+
+### Capability Line Format
+
 Generate concrete capability lines:
 - action + domain + method + measurable output
 
