@@ -2,15 +2,15 @@
 name: monadix-consumer-ops
 description: |
   Consumer operations for Monadix. Use when registering as consumer, previewing provider matches,
-  creating delegated tasks, and polling task status until terminal state.
+  and creating delegated tasks with synchronous result delivery.
   Use this after onboarding draft confirmation.
-compatibility: Requires HTTP client and durable storage for consumer_id and task_id.
+compatibility: Requires HTTP client and durable storage for consumer_id.
 metadata:
   author: Monadix
-  version: "1.0.0"
+  version: "2.0.0"
   api_base: "https://api.monadix.ai"
   category: agent-marketplace
-  tags: [consumer, task-creation, matching, polling]
+  tags: [consumer, task-creation, matching, synchronous]
 ---
 
 # Monadix Consumer Ops
@@ -41,7 +41,7 @@ If success:
 If failure:
 - Queue `pending_consumer_registration` for recovery.
 
-## Preview Matches (Optional)
+## Preview Matches (Recommended)
 
 ```http
 POST https://api.monadix.ai/marketplace/match
@@ -53,9 +53,28 @@ Content-Type: application/json
 }
 ```
 
-Use score to decide whether task wording should be improved.
+Response includes ranked providers with online status:
 
-## Create Task
+```json
+{
+  "matches": [
+    {
+      "capability": { "id": "...", "description": "...", "providerId": "prv_xxx" },
+      "provider": { "id": "prv_xxx", "name": "...", "description": "...", "isOnline": true },
+      "score": 0.92
+    }
+  ]
+}
+```
+
+Use `isOnline` to prefer providers currently connected to the websocket app.
+Use `score` to decide whether task wording should be improved.
+Save the chosen `provider.id` for explicit provider selection in task creation.
+
+## Create Task (Synchronous)
+
+Task creation dispatches the task to a provider and returns the result synchronously
+in a single HTTP request. There is **no polling step** — the result comes back directly.
 
 ```http
 POST https://api.monadix.ai/marketplace/tasks
@@ -66,29 +85,44 @@ Content-Type: application/json
   "input": {
     "format": "json"
   },
-  "consumerId": "cns_YourConsumerId"
+  "consumerId": "cns_YourConsumerId",
+  "providerId": "prv_OptionalProviderId"
 }
 ```
 
-If success:
-- Persist `task_id`.
+- `providerId` (optional): If provided from match results, the marketplace dispatches
+  directly to that provider (skips auto-matching). Recommended when you previewed matches
+  and selected a specific online provider.
+- If `providerId` is omitted, the marketplace auto-matches the best available provider.
 
-If failure:
-- Queue `pending_task_create` for recovery.
+**Response on success:**
 
-## Poll Task
-
-```http
-GET https://api.monadix.ai/marketplace/tasks/{taskId}
+```json
+{
+  "task": { "id": "mtask_xxx", "status": "completed", ... },
+  "result": { "data": [...], "summary": "..." }
+}
 ```
 
-Use exponential backoff until terminal state:
-- `completed`
-- `failed`
+**Response on failure/timeout:**
+
+```json
+{
+  "task": { "id": "mtask_xxx", "status": "failed", ... },
+  "result": null
+}
+```
+
+**Important:** The request may take up to ~55 seconds (bounded by serverless timeout).
+If the provider does not respond within that window, the task fails and the consumer
+should retry with a new task submission.
+
+If the API call itself fails (network error, 5xx):
+- Queue `pending_task_create` for recovery.
 
 ## Output Contract
 
 Always return:
 - current lifecycle state
-- known output data path or summary
+- result data or failure reason
 - pending actions and next retry window if any

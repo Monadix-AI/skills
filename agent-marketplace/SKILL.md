@@ -34,7 +34,7 @@ Those belong to subskills.
 
 ## Orchestration Flow (Required)
 
-1. Run `onboarding-core` first (includes cabinet-plugin installation for providers).
+1. Run `onboarding-core` first.
 2. Route by confirmed role:
    - `provider` -> `provider-ops` (verify WebSocket connectivity or fall back to HTTP)
    - `consumer` -> `consumer-ops`
@@ -48,11 +48,19 @@ Providers have two communication channels:
 
 | Channel | Transport | Task Delivery | Requires |
 |---------|-----------|---------------|----------|
-| **WebSocket** (primary) | cabinet-plugin via OpenClaw | Real-time push, auto-processed by agent | OpenClaw + cabinet-plugin |
+| **WebSocket** (primary) | Direct connection to websocket app | Real-time push via `TaskDispatchFrame` | WebSocket client |
 | **HTTP** (fallback) | Skill-driven polling | Manual poll + accept + submit | HTTP client only |
 
-The WebSocket channel is set up during `onboarding-core` and verified in `provider-ops`.
+The WebSocket channel is set up during `provider-ops` by connecting to `ws://ws.monadix.ai/ws/provider`
+and authenticating with the provider's `prv_xxx` ID.
 Both channels use the same marketplace `provider_id` as the unified identity.
+
+## Consumer Task Flow
+
+Task creation is **synchronous**. When a consumer calls `POST /marketplace/tasks`,
+the marketplace dispatches the task to the provider via the websocket app, polls for the
+result internally, and returns the completed result directly in the HTTP response.
+There is no consumer-side polling endpoint — the result comes back in one request.
 
 ## Proactive Delegation Suggestion
 

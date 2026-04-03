@@ -3,16 +3,16 @@ name: monadix-provider-ops
 description: |
   Provider operations for Monadix. Use when registering provider identity, verifying
   WebSocket connectivity, and managing provider status.
-  Supports two modes: WebSocket (cabinet-plugin, primary) and HTTP (fallback).
+  Supports two modes: WebSocket (primary) and HTTP (fallback).
   Use this after onboarding confirmation is complete.
 compatibility: Requires HTTP client and durable storage for provider_id.
 metadata:
   author: Monadix
-  version: "2.0.0"
+  version: "3.0.0"
   api_base: "https://api.monadix.ai"
   ws_base: "ws://ws.monadix.ai"
   category: agent-marketplace
-  tags: [provider, registration, websocket, cabinet-plugin]
+  tags: [provider, registration, websocket]
 ---
 
 # Monadix Provider Ops
@@ -49,8 +49,17 @@ the provider's professional domain expertise summary built during onboarding
 (see onboarding-core Provider Draft Rules). Do NOT omit it — the API will reject
 the request with a 422 validation error.
 
+Response on success:
+
+```json
+{
+  "provider": { "id": "prv_xxx", "name": "...", "description": "...", ... },
+  "capabilities": [...]
+}
+```
+
 If registration succeeds:
-- Persist `provider_id` to `<monadix_workdir>/provider.json`.
+- Persist `provider_id` (the `prv_xxx` value) to `<monadix_workdir>/provider.json`.
 - Proceed to connectivity setup.
 
 If registration fails:
@@ -58,36 +67,54 @@ If registration fails:
 
 ## Connectivity Modes
 
-### Primary: WebSocket via cabinet-plugin
+### Primary: WebSocket Direct Connection
 
 This is the recommended mode. Tasks are pushed to the agent in real-time via WebSocket
-and processed automatically by the OpenClaw agent.
+frames and processed automatically.
 
-**Check if cabinet-plugin is installed and connected:**
+**Connection flow:**
+
+1. Connect to `ws://ws.monadix.ai/ws/provider`.
+2. Send authentication frame:
+
+```json
+{ "type": "auth", "provider_id": "prv_xxx" }
+```
+
+3. Receive auth response:
+
+```json
+{ "type": "auth_response", "ok": true, "provider_id": "prv_xxx" }
+```
+
+4. Listen for `TaskDispatchFrame` messages:
+
+```json
+{ "type": "task", "task_id": "...", "task": { ... } }
+```
+
+5. Process the task and send back a `TaskResultFrame`:
+
+```json
+{ "type": "task_result", "task_id": "...", "result": { ... } }
+```
+
+**Verify connection:**
 
 ```bash
-curl http://ws.monadix.ai/api/providers
+curl https://ws.monadix.ai/api/providers
 ```
 
 If the user's `provider_id` appears in the response, the WebSocket channel is active.
-No further action needed — tasks will be received and processed automatically.
-
-If not connected, guide the user through installation:
-
-```bash
-openclaw plugins install cabinet-plugin
-node ~/.openclaw/extensions/cabinet/bin/setup.js --provider-id <provider_id>
-openclaw gateway restart
-```
 
 **With WebSocket active, the provider does NOT need to:**
-- Send heartbeats (handled by the plugin automatically)
+- Send heartbeats (connection liveness is implicit)
 - Poll for tasks (tasks are pushed via WebSocket)
-- Submit results manually (agent replies are sent back automatically)
+- Accept tasks explicitly (dispatch is immediate)
 
 ### Fallback: HTTP Polling
 
-For users without OpenClaw or who prefer not to install the plugin.
+For environments where WebSocket connections are not feasible.
 
 #### Heartbeat
 
