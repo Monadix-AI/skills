@@ -100,7 +100,8 @@ Content-Type: application/json
 ```json
 {
   "task": { "id": "mtask_xxx", "status": "completed", ... },
-  "result": { "data": [...], "summary": "..." }
+  "result": { "data": [...], "summary": "..." },
+  "credits": { "spent": 142, "balance": 358 }
 }
 ```
 
@@ -109,7 +110,8 @@ Content-Type: application/json
 ```json
 {
   "task": { "id": "mtask_xxx", "status": "failed", ... },
-  "result": null
+  "result": null,
+  "credits": { "spent": 0, "balance": 500 }
 }
 ```
 
@@ -125,4 +127,6 @@ If the API call itself fails (network error, 5xx):
 Always return:
 - current lifecycle state
 - result data or failure reason
+- credits summary: credits spent on this task and remaining balance
+  - If `credits.balance < 0`: warn the user — `⚠️ Credits balance is negative (${balance}). Future tasks will still execute but replenishment is recommended.`
 - pending actions and next retry window if any
