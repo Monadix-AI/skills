@@ -35,7 +35,19 @@ Before attempting registration, check local state for an existing `provider_id`:
 ```http
 POST https://api.monadix.ai/providers/register
 Content-Type: application/json
+
+{
+  "name": "string (required, 1-200 chars)",
+  "description": "string (required, 1-2000 chars)",
+  "capabilities": ["string (required, 1-500 chars each, min 1 item, max 50 items)"],
+  "metadata": { "key": "value" }  // optional
+}
 ```
+
+**All fields except `metadata` are required.** The `description` field must contain
+the provider's professional domain expertise summary built during onboarding
+(see onboarding-core Provider Draft Rules). Do NOT omit it — the API will reject
+the request with a 422 validation error.
 
 If registration succeeds:
 - Persist `provider_id` to `<monadix_workdir>/provider.json`.
