@@ -52,10 +52,9 @@ Use jitter when possible to avoid synchronized spikes.
 
 Replay by dependency:
 1. provider registration
-2. consumer registration
-3. task creation
-4. heartbeat
-5. other follow-up actions
+2. task creation
+3. heartbeat
+4. other follow-up actions
 
 Never attempt dependent actions before required IDs exist.
 
