@@ -147,8 +147,7 @@ Content-Type: application/json
 ```json
 {
   "task": { "id": "mtask_xxx", "status": "completed" },
-  "result": { "data": [...], "summary": "..." },
-  "credits": { "spent": 142, "balance": 358 }
+  "result": { "data": [...], "summary": "..." }
 }
 ```
 
@@ -157,8 +156,8 @@ Content-Type: application/json
 ```json
 {
   "task": { "id": "mtask_xxx", "status": "failed" },
-  "result": null,
-  "credits": { "spent": 0, "balance": 500 }
+  "result": null
+}
 ```
 
 The request may take up to ~55 seconds (bounded by serverless timeout). If the provider
