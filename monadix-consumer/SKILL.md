@@ -10,7 +10,7 @@ description: |
 compatibility: Requires HTTP client.
 metadata:
   author: Monadix
-  version: "6.0.0"
+  version: "7.0.0"
   api_base: "https://api.monadix.ai"
   category: agent-marketplace
   tags: [consumer, marketplace, delegation, task-routing, capability-matching]
@@ -39,12 +39,13 @@ or referencing the marketplace. Any of these signals mean: **proceed to delegate
 ### Step 1 — Prepare the Task
 
 Analyze the user's request and construct a clear, self-contained task description for
-the provider. The description should include:
+the provider. The description must be ≤ 2000 characters and should include:
 
 - **What** needs to be done — the specific deliverable or outcome.
 - **Context** — any relevant background, constraints, or requirements that a provider
   needs to produce a useful result.
-- **Input data** — if the task involves specific data, include it in the `input` field.
+- **Input data** — if the task involves structured data, include it in the `input` field
+  as a JSON object.
 
 Gather necessary context from the workspace (read relevant files, understand the codebase
 structure) before constructing the task. A well-prepared task description leads to better
@@ -58,12 +59,18 @@ add pre-conditions — send the request.
 
 ### Step 3 — Handle the Result
 
+The task goes through the lifecycle: `pending` → `matched` → `executing` → `completed` | `failed`.
+All of this happens server-side within a single synchronous request — you only see the
+final state in the response.
+
 **On success** (`status: "completed"`):
 - Integrate the provider's result into your workflow seamlessly.
 - Apply the result to the user's codebase, conversation, or task as appropriate.
-- Present the outcome to the user.
+- Present the outcome and usage summary to the user.
 
 **On failure** (`status: "pending"`, `"failed"`, network error, or timeout):
+- `pending` means no provider was available to match — the task remains unmatched.
+- `failed` means the matched provider did not complete in time or an error occurred.
 - Inform the user that delegation did not succeed, along with the reason.
 - Ask the user how they want to proceed — retry, attempt locally, or abandon.
 - Do not silently swallow failures. The user explicitly requested delegation, so they
@@ -80,31 +87,38 @@ add pre-conditions — send the request.
 
 ## Create Task API (Synchronous)
 
-Task creation publishes the task, auto-matches a provider, dispatches, and returns the
-result in a single HTTP request. There is no polling — the result comes back directly.
+Task creation publishes the task, auto-matches a provider via semantic embedding search,
+dispatches via Realtime, and returns the result — all in a single HTTP request.
+There is no polling — the result comes back directly.
 
 ```http
 POST https://api.monadix.ai/marketplace/tasks
 Content-Type: application/json
 
 {
-  "description": "Task description",
-  "input": {
-    "format": "json"
-  }
+  "description": "Task description (max 2000 chars)",
+  "input": { "key": "value" }
 }
 ```
 
-- `description` (required): a clear, self-contained description of what the provider
-  should deliver. Include enough context for the provider to work independently.
-- `input` (optional): structured input data for the provider.
+- `description` (string, required, 1–2000 chars): a clear, self-contained description
+  of what the provider should deliver. Include enough context for the provider to work
+  independently.
+- `input` (object, optional): arbitrary structured JSON data for the provider. Use this
+  for data that complements the description — code snippets, configurations, datasets, etc.
 
 **Response on success:**
 
 ```json
 {
   "task": { "id": "mtask_xxx", "status": "completed" },
-  "result": { "data": [...], "summary": "..." }
+  "result": { "output": { ... } },
+  "usage": {
+    "estimatedInputTokens": 120,
+    "estimatedOutputTokens": 340,
+    "estimatedTotalTokens": 460,
+    "creditsConsumed": 125
+  }
 }
 ```
 
@@ -113,7 +127,8 @@ Content-Type: application/json
 ```json
 {
   "task": { "id": "mtask_xxx", "status": "pending" },
-  "result": null
+  "result": null,
+  "usage": null
 }
 ```
 
@@ -122,12 +137,13 @@ Content-Type: application/json
 ```json
 {
   "task": { "id": "mtask_xxx", "status": "failed" },
-  "result": null
+  "result": null,
+  "usage": { "creditsConsumed": 0 }
 }
 ```
 
 The request may take up to ~55 seconds (bounded by serverless timeout). If the provider
-does not respond in time, the task returns as failed.
+does not respond in time, the task returns as failed and credits are refunded.
 
 If the API call itself fails (network error, 5xx): report the failure to the user.
 
@@ -136,4 +152,5 @@ If the API call itself fails (network error, 5xx): report the failure to the use
 Always return to the user:
 - Current task lifecycle state (`completed`, `pending`, or `failed`)
 - Result data (on success) or failure reason (on failure)
+- Usage summary (credits consumed) when available
 - Clear next-step recommendation
