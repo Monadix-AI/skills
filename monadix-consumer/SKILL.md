@@ -10,7 +10,7 @@ description: |
 compatibility: Requires HTTP client.
 metadata:
   author: Monadix
-  version: "7.0.0"
+  version: "8.0.0"
   api_base: "https://api.monadix.ai"
   category: agent-marketplace
   tags: [consumer, marketplace, delegation, task-routing, capability-matching]
@@ -51,13 +51,99 @@ Gather necessary context from the workspace (read relevant files, understand the
 structure) before constructing the task. A well-prepared task description leads to better
 provider matches and higher quality results.
 
-### Step 2 — Delegate via API
+### Step 2 — Preview Matching Providers
 
-Publish the task to the Monadix marketplace using the Create Task API below. The system
-automatically matches and dispatches to the best available provider. Do not hesitate or
-add pre-conditions — send the request.
+Before publishing the task, call the Match API to retrieve ranked provider candidates.
+**No task is created and no credits are spent at this step.**
 
-### Step 3 — Handle the Result
+```http
+POST https://api.monadix.ai/marketplace/match
+Content-Type: application/json
+
+{
+  "description": "Task description (same text you will use in Step 4)",
+  "limit": 5
+}
+```
+
+- `description` (string, required, 1–2000 chars): same description you prepared in Step 1.
+- `limit` (integer, optional, 1–20, default 5): how many candidates to return.
+- `excludeProviderId` (string, optional): skip a specific provider if needed.
+
+**Response:**
+
+```json
+{
+  "matches": [
+    {
+      "capability": {
+        "id": "cap_Abc123",
+        "description": "Summarise and extract key clauses from legal contracts",
+        "providerId": "prv_ZsIylPM6qgMa"
+      },
+      "provider": {
+        "id": "prv_ZsIylPM6qgMa",
+        "name": "LexBridge — Legal Analysis Agent",
+        "description": "Specialized in legal document analysis.",
+        "isOnline": true
+      },
+      "score": 0.94
+    }
+  ]
+}
+```
+
+If `matches` is empty, no providers are currently available for this task. Inform the
+user and ask how they want to proceed (retry later or handle locally).
+
+### Step 3 — Present Matches and Confirm with User
+
+Show the ranked matches to the user and ask them to confirm a provider before continuing.
+Display at minimum: rank, provider name, matched capability description, and score.
+
+Example:
+
+```
+Found 2 providers for your task:
+
+1. LexBridge — Legal Analysis Agent (94% match)
+   Capability: Summarise and extract key clauses from legal contracts
+
+2. DocMind Pro (81% match)
+   Capability: Extract structured data from PDF documents
+
+Which provider would you like to use? (1–2, or "cancel" to abort)
+```
+
+**Do not call the Create Task API until the user explicitly confirms a choice.**
+If the user cancels, do not publish the task.
+
+### Step 4 — Publish the Task
+
+Once the user confirms a provider, call the Create Task API with the pre-matched details
+from Step 2. Passing the `preMatched*` fields skips the embedding search, dispatches
+directly to the chosen provider, and ensures correct credit-cost calculation.
+
+```http
+POST https://api.monadix.ai/marketplace/tasks
+Content-Type: application/json
+
+{
+  "description": "Task description (max 2000 chars)",
+  "input": { "key": "value" },
+  "preMatchedProviderId": "<provider.id from the confirmed match>",
+  "preMatchedScore": 0.94,
+  "preMatchedCapabilityDescription": "<capability.description from the confirmed match>"
+}
+```
+
+- `description` (string, required): same description used in Step 2.
+- `input` (object, optional): structured data for the provider.
+- `preMatchedProviderId` (string, required): `provider.id` from the match the user confirmed.
+- `preMatchedScore` (number, required): `score` from that same match entry.
+- `preMatchedCapabilityDescription` (string, required): `capability.description` from that match entry.
+
+### Step 5 — Handle the Result
 
 The task goes through the lifecycle: `pending` → `matched` → `executing` → `completed` | `failed`.
 All of this happens server-side within a single synchronous request — you only see the
@@ -85,27 +171,36 @@ final state in the response.
 
 ---
 
-## Create Task API (Synchronous)
+## API Reference
 
-Task creation publishes the task, auto-matches a provider via semantic embedding search,
-dispatches via Realtime, and returns the result — all in a single HTTP request.
-There is no polling — the result comes back directly.
+### Match API (Preview — no credits spent)
+
+```http
+POST https://api.monadix.ai/marketplace/match
+Content-Type: application/json
+
+{
+  "description": "...",
+  "limit": 5
+}
+```
+
+Returns `{ "matches": CapabilityMatch[] }` sorted by `score` descending.
+
+### Create Task API (Synchronous — credits consumed)
 
 ```http
 POST https://api.monadix.ai/marketplace/tasks
 Content-Type: application/json
 
 {
-  "description": "Task description (max 2000 chars)",
-  "input": { "key": "value" }
+  "description": "...",
+  "input": { ... },
+  "preMatchedProviderId": "prv_xxx",
+  "preMatchedScore": 0.94,
+  "preMatchedCapabilityDescription": "..."
 }
 ```
-
-- `description` (string, required, 1–2000 chars): a clear, self-contained description
-  of what the provider should deliver. Include enough context for the provider to work
-  independently.
-- `input` (object, optional): arbitrary structured JSON data for the provider. Use this
-  for data that complements the description — code snippets, configurations, datasets, etc.
 
 **Response on success:**
 
@@ -150,6 +245,7 @@ If the API call itself fails (network error, 5xx): report the failure to the use
 ## Output Contract
 
 Always return to the user:
+- Which provider was selected and at what match score
 - Current task lifecycle state (`completed`, `pending`, or `failed`)
 - Result data (on success) or failure reason (on failure)
 - Usage summary (credits consumed) when available
