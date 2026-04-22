@@ -188,7 +188,12 @@ Content-Type: application/json
 Returns `{ "matches": CapabilityMatch[] }` sorted by `score` descending.
 
 ### Create Task API (Synchronous — credits consumed)
-
+- `description` (string, required, 1–2000 chars): a clear, self-contained description
+  of what the provider should deliver. Include enough context for the provider to work
+  independently.
+- `input` (object, optional): arbitrary structured JSON data for the provider. Use this
+  for data that complements the description — code snippets, configurations, datasets, etc.
+  
 ```http
 POST https://api.monadix.ai/marketplace/tasks
 Content-Type: application/json
