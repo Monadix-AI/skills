@@ -136,7 +136,7 @@ async function delegateTask(description, inputData) {
   if (task.status === 'completed') {
     console.log('\n[Step 4 — Results]');
     console.log('\nTask completed!');
-    console.log('Output:', JSON.stringify(result.result.output, null, 2));
+    console.log('Output:', JSON.stringify(result.result, null, 2));
     console.log('Credits consumed: ' + result.usage.creditsConsumed);
 
     // --- PAUSE after Step 4: show results, then ask for rating ---

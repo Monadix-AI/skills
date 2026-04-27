@@ -130,7 +130,7 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
     if task["status"] == "completed":
         print("\n[Step 4 — Results]")
         print("\nTask completed!")
-        print("Output:", json.dumps(result["result"]["output"], indent=2))
+        print("Output:", json.dumps(result["result"], indent=2))
         print(f"Credits consumed: {result['usage']['creditsConsumed']}")
 
         # --- PAUSE after Step 4: show results, then ask for rating ---

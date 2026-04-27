@@ -199,8 +199,8 @@ The tool returns a text summary in `content[0].text` and the full payload in
 
 ```json
 {
-  "task": { "id": "mtask_xxx", "status": "completed" },
-  "result": { "output": { "...": "..." } },
+  "task": { "id": "mtask_A1b2C3d4E5f6G7h8I9", "status": "completed" },
+  "result": { "text": "..." },
   "usage": {
     "estimatedInputTokens": 120,
     "estimatedOutputTokens": 340,
@@ -212,7 +212,7 @@ The tool returns a text summary in `content[0].text` and the full payload in
 
 **On success** (`status: "completed"`):
 
-- Integrate the provider's `result.output` into your workflow seamlessly.
+- Integrate the provider's `result` data into your workflow seamlessly.
 - Apply the result to the user's codebase, conversation, or task as appropriate.
 - Present the outcome and usage summary to the user.
 
@@ -268,7 +268,7 @@ Input:
 
 Output (`structuredContent`):
 
-- On success: `{ task: { id, status: "completed" }, result: { output }, usage: { ... } }`
+- On success: `{ task: { id, status: "completed" }, result: { text, ...providerFields }, usage: { ... } }`
 - No provider matched: `{ task: { id, status: "pending" }, result: null, usage: null }`
 - Failure / timeout: `{ task: { id, status: "failed" }, result: null, usage: { creditsConsumed: 0 } }`
 

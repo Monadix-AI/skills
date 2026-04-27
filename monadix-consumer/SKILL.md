@@ -276,6 +276,12 @@ Content-Type: application/json
 After calling the API, immediately report back to the user that the task has been published
 and is being executed (e.g. `"Task published to LexBridge — waiting for result…"`).
 
+**Immediately extract `task.id` from the response body** — it is the `id` field inside the
+`task` object, with the format `mtask_` followed by exactly 18 alphanumeric characters
+(e.g. `mtask_A1b2C3d4E5f6G7h8I9`). Retain this exact value for use in Step 5. Never
+substitute the capability ID (`cap_*`), provider ID (`prv_*`), or any other value in its
+place. If the response does not contain a `task.id`, do not attempt to rate the task.
+
 **⏸ PAUSE after Step 3.** The Create Task API call is synchronous — wait for the HTTP
 response before continuing. Do not show results until the response arrives.
 
@@ -318,7 +324,7 @@ Would you like to rate this provider's work? (1–5 stars, or "skip")
 If the user supplies a number 1–5, submit the rating:
 
 ```http
-POST https://api.monadix.ai/marketplace/tasks/<task.id>/rate
+POST https://api.monadix.ai/marketplace/tasks/<task.id from the Step 3 response>/rate
 Authorization: Bearer <monadix.key contents>
 X-Monadix-Timestamp: <unix-ms>
 X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
@@ -331,6 +337,11 @@ Content-Type: application/json
 
 Rules:
 
+- **Use only the exact `task.id` extracted from the Step 3 response body.** The ID has the
+  format `mtask_` followed by exactly 18 alphanumeric characters. Never fabricate, guess,
+  derive, or substitute a different ID (e.g. do not use a capability ID or provider ID).
+  If you do not have the exact `task.id` from Step 3, skip this step entirely and inform
+  the user that rating is unavailable.
 - Only completed tasks are eligible. Skip Step 5 entirely if the task is `pending` or `failed`.
 - Each task can be rated **once**. The server returns `409 Conflict` on a second attempt;
   treat that as already-rated and move on.
@@ -416,8 +427,8 @@ Content-Type: application/json
 
 ```json
 {
-  "task": { "id": "mtask_xxx", "status": "completed" },
-  "result": { "output": { ... } },
+  "task": { "id": "mtask_A1b2C3d4E5f6G7h8I9", "status": "completed", "..." : "..." },
+  "result": { "text": "..." },
   "usage": {
     "estimatedInputTokens": 120,
     "estimatedOutputTokens": 340,
@@ -427,11 +438,16 @@ Content-Type: application/json
 }
 ```
 
+`result` is the provider's raw output object submitted via `POST /marketplace/tasks/:id/result`.
+For Monadix-native providers (Cabinet desktop agent) the shape is `{ "text": "..." }`;
+other providers may return additional or different keys. `task.id` is the value you must
+retain to submit a rating in Step 5.
+
 **Response when no provider matched:**
 
 ```json
 {
-  "task": { "id": "mtask_xxx", "status": "pending" },
+  "task": { "id": "mtask_A1b2C3d4E5f6G7h8I9", "status": "pending", "..." : "..." },
   "result": null,
   "usage": null
 }
@@ -441,7 +457,7 @@ Content-Type: application/json
 
 ```json
 {
-  "task": { "id": "mtask_xxx", "status": "failed" },
+  "task": { "id": "mtask_A1b2C3d4E5f6G7h8I9", "status": "failed", "..." : "..." },
   "result": null,
   "usage": { "creditsConsumed": 0 }
 }
@@ -458,7 +474,7 @@ Submit a 1–5 star rating for a completed task you previously created. Ratings 
 immutable: once a task has been rated, further attempts return `409 Conflict`.
 
 ```http
-POST https://api.monadix.ai/marketplace/tasks/<task.id>/rate
+POST https://api.monadix.ai/marketplace/tasks/<task.id from the POST /marketplace/tasks response>/rate
 Authorization: Bearer <monadix.key contents>
 X-Monadix-Timestamp: <unix-ms>
 X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
