@@ -12,7 +12,7 @@ description: |
 compatibility: Requires an HTTP client and an HMAC-SHA256 implementation. The skill bundle includes a `monadix.key` file (Bearer token) and a `monadix.signing-key` file (HMAC secret).
 metadata:
   author: Monadix
-  version: "12.0.0"
+  version: "13.0.0"
   api_base: "https://api.monadix.ai"
   category: agent-marketplace
   tags: [consumer, marketplace, delegation, task-routing, capability-matching]
