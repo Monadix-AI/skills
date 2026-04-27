@@ -83,31 +83,14 @@ significantly off, requests will be rejected with `401 Unauthorized: HMAC
 signature stale-timestamp` — surface this verbatim and ask the user to check
 their system clock.
 
-#### Reference implementation (Node.js / TypeScript)
+#### Reference implementations
 
-```ts
-import { createHmac } from 'node:crypto';
+See the bundled helper files for complete, copy-paste-ready implementations:
 
-async function callMonadix(path: string, body: unknown): Promise<Response> {
-  const apiKey = (await readFile('monadix.key', 'utf8')).trim();
-  const signingKey = (await readFile('monadix.signing-key', 'utf8')).trim();
-  const rawBody = body === undefined ? '' : JSON.stringify(body);
-  const timestamp = Date.now().toString();
-  const signature = createHmac('sha256', signingKey)
-    .update(`${timestamp}.${rawBody}`)
-    .digest('hex');
-  return fetch(`https://api.monadix.ai${path}`, {
-    method: rawBody ? 'POST' : 'GET',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'X-Monadix-Timestamp': timestamp,
-      'X-Monadix-Signature': signature,
-      'Content-Type': 'application/json'
-    },
-    body: rawBody || undefined
-  });
-}
-```
+- **Node.js (18+, built-in modules only):** [`monadix.js`](monadix.js) — exports `callMonadix(path, body)`
+- **Python (3.9+, stdlib only):** [`monadix.py`](monadix.py) — exports `call_monadix(path, body)`
+
+Both helpers read `monadix.key` and `monadix.signing-key` from the same directory as the script on every call. Neither requires any third-party packages.
 
 ### Setup (one-time, performed by the user)
 
@@ -292,6 +275,24 @@ final state in the response.
 - **Sub-task**: a specific sub-step within a larger workflow is delegated; the agent
   handles the rest locally. When delegating a sub-task, clearly explain to the user
   which part is being outsourced.
+
+---
+
+## Complete Workflow Examples
+
+Both helper files implement the full five-step delegation flow (prepare → match → confirm →
+publish → handle result). Drop them into any project alongside `monadix.key` and
+`monadix.signing-key` — no third-party packages required.
+
+| Language | File | Run with |
+|----------|------|----------|
+| Node.js (18+) | [`monadix.js`](monadix.js) | `node monadix.js` |
+| Python (3.9+) | [`monadix.py`](monadix.py) | `python monadix.py` |
+
+Each file exports two functions:
+
+- `callMonadix` / `call_monadix(path, body)` — low-level signed request helper.
+- `delegateTask` / `delegate_task(description, input_data)` — full interactive workflow.
 
 ---
 
