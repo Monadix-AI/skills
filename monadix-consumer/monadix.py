@@ -60,19 +60,32 @@ def call_monadix(path: str, body: dict | None = None) -> dict:
         return json.loads(resp.read().decode())
 
 
+def rate_task(task_id: str, rating: int) -> str | None:
+    """
+    Submit a 1-5 star rating for a previously completed task.
+    Returns None on success or a string error message on a 4xx soft failure.
+    """
+    try:
+        call_monadix(f"/marketplace/tasks/{task_id}/rate", {"rating": rating})
+        return None
+    except (urllib.error.HTTPError, urllib.error.URLError) as err:
+        return str(err)
+
+
 def delegate_task(description: str, input_data: dict | None = None) -> None:
     """
-    Full five-step delegation workflow:
-      Step 2 — match providers (no credits spent)
-      Step 3 — present matches, ask user to confirm
-      Step 4 — publish the task to the confirmed provider
-      Step 5 — report the result
+    Full delegation workflow (step-by-step — pauses at each boundary):
+      Step 1 — Match:        call the match API, print ranked providers
+      Step 2 — Confirm:      ask the user to pick a provider (or cancel)
+      Step 3 — Publish Task: publish to the chosen provider
+      Step 4 — Show Results: print the provider's output and usage summary
+      Step 5 — Rate:         offer the user a 1–5 star rating prompt
 
     Args:
         description: Task description (max 2000 chars)
         input_data:  Optional structured input for the provider
     """
-    # Step 2 — Match providers (no credits spent)
+    # Step 1 — Match: find providers (no credits spent)
     print("Matching providers...")
     data = call_monadix("/marketplace/match", {"description": description, "limit": 5})
     matches = data.get("matches", [])
@@ -80,12 +93,14 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
         print("No providers available for this task.")
         return
 
-    # Step 3 — Present matches and confirm
+    # --- PAUSE after Step 1: show results and wait for user selection ---
+    print("\n[Step 1 complete — Match results]")
     print(f"\nFound {len(matches)} provider(s):")
     for i, m in enumerate(matches, 1):
         print(f"{i}. {m['provider']['name']} ({round(m['score'] * 100)}% match)")
         print(f"   Capability: {m['capability']['description']}")
 
+    # Step 2 — Confirm: wait for the user to choose a provider
     answer = input("\nWhich provider? (number or 'cancel'): ").strip().lower()
     if answer == "cancel":
         print("Delegation cancelled.")
@@ -98,7 +113,7 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
         return
     chosen = matches[idx]
 
-    # Step 4 — Publish the task
+    # Step 3 — Publish Task: send to the chosen provider
     print(f"\nDelegating to {chosen['provider']['name']}...")
     payload: dict = {
         "description": description,
@@ -110,12 +125,27 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
         payload["input"] = input_data
     result = call_monadix("/marketplace/tasks", payload)
 
-    # Step 5 — Handle the result
+    # Step 4 — Show Results
     task = result["task"]
     if task["status"] == "completed":
+        print("\n[Step 4 — Results]")
         print("\nTask completed!")
         print("Output:", json.dumps(result["result"]["output"], indent=2))
         print(f"Credits consumed: {result['usage']['creditsConsumed']}")
+
+        # --- PAUSE after Step 4: show results, then ask for rating ---
+
+        # Step 5 — Rate: offer a 1–5 star rating (skip on non-completed tasks)
+        rating_answer = input("\n[Step 5 — Rate] Rate this provider (1–5, or 'skip'): ").strip()
+        try:
+            rating = int(rating_answer)
+        except ValueError:
+            rating = 0
+        if 1 <= rating <= 5:
+            err = rate_task(task["id"], rating)
+            print(f"Rating not recorded: {err}" if err else f"Rated {rating}\u2605")
+        else:
+            print("Rating skipped.")
     else:
         print(f"\nTask {task['status']}. Delegation did not succeed.")
 

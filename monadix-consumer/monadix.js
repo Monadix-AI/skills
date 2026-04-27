@@ -56,17 +56,35 @@ async function callMonadix(apiPath, body) {
 }
 
 /**
- * Full five-step delegation workflow:
- *   Step 2 — match providers (no credits spent)
- *   Step 3 — present matches, ask user to confirm
- *   Step 4 — publish the task to the confirmed provider
- *   Step 5 — report the result
+ * Submit a 1-5 star rating for a previously completed task.
+ * Returns null on success or a string error message on a 4xx soft failure.
+ *
+ * @param {string} taskId
+ * @param {number} rating - integer 1..5
+ * @returns {Promise<string|null>}
+ */
+async function rateTask(taskId, rating) {
+  try {
+    await callMonadix('/marketplace/tasks/' + encodeURIComponent(taskId) + '/rate', { rating: rating });
+    return null;
+  } catch (err) {
+    return String(err && err.message ? err.message : err);
+  }
+}
+
+/**
+ * Full delegation workflow (step-by-step — pauses at each boundary):
+ *   Step 1 — Match:        call the match API, print ranked providers
+ *   Step 2 — Confirm:      ask the user to pick a provider (or cancel)
+ *   Step 3 — Publish Task: publish to the chosen provider
+ *   Step 4 — Show Results: print the provider's output and usage summary
+ *   Step 5 — Rate:         offer the user a 1–5 star rating prompt
  *
  * @param {string} description   - Task description (max 2000 chars)
  * @param {object} [inputData]   - Optional structured input for the provider
  */
 async function delegateTask(description, inputData) {
-  // Step 2 — Match providers (no credits spent)
+  // Step 1 — Match: find providers (no credits spent)
   console.log('Matching providers...');
   var matchData = await callMonadix('/marketplace/match', { description: description, limit: 5 });
   var matches = matchData.matches;
@@ -75,7 +93,8 @@ async function delegateTask(description, inputData) {
     return;
   }
 
-  // Step 3 — Present matches and confirm
+  // --- PAUSE after Step 1: show results and wait for user selection ---
+  console.log('\n[Step 1 complete — Match results]');
   console.log('\nFound ' + matches.length + ' provider(s):');
   matches.forEach(function (m, i) {
     console.log((i + 1) + '. ' + m.provider.name + ' (' + Math.round(m.score * 100) + '% match)');
@@ -83,6 +102,8 @@ async function delegateTask(description, inputData) {
   });
 
   var rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  // Step 2 — Confirm: wait for the user to choose a provider
   var answer = await prompt(rl, '\nWhich provider? (number or "cancel"): ');
   rl.close();
 
@@ -97,7 +118,7 @@ async function delegateTask(description, inputData) {
   }
   var chosen = matches[idx];
 
-  // Step 4 — Publish the task
+  // Step 3 — Publish Task: send to the chosen provider
   console.log('\nDelegating to ' + chosen.provider.name + '...');
   var payload = {
     description: description,
@@ -110,18 +131,33 @@ async function delegateTask(description, inputData) {
   }
   var result = await callMonadix('/marketplace/tasks', payload);
 
-  // Step 5 — Handle the result
+  // Step 4 — Show Results
   var task = result.task;
   if (task.status === 'completed') {
+    console.log('\n[Step 4 — Results]');
     console.log('\nTask completed!');
     console.log('Output:', JSON.stringify(result.result.output, null, 2));
     console.log('Credits consumed: ' + result.usage.creditsConsumed);
+
+    // --- PAUSE after Step 4: show results, then ask for rating ---
+
+    // Step 5 — Rate: offer a 1–5 star rating (skip on non-completed tasks)
+    var rl2 = readline.createInterface({ input: process.stdin, output: process.stdout });
+    var ratingAnswer = await prompt(rl2, '\n[Step 5 — Rate] Rate this provider (1–5, or "skip"): ');
+    rl2.close();
+    var rating = parseInt(String(ratingAnswer).trim(), 10);
+    if (rating >= 1 && rating <= 5) {
+      var err = await rateTask(task.id, rating);
+      console.log(err ? 'Rating not recorded: ' + err : 'Rated ' + rating + '★');
+    } else {
+      console.log('Rating skipped.');
+    }
   } else {
     console.log('\nTask ' + task.status + '. Delegation did not succeed.');
   }
 }
 
-module.exports = { callMonadix: callMonadix, delegateTask: delegateTask };
+module.exports = { callMonadix: callMonadix, delegateTask: delegateTask, rateTask: rateTask };
 
 // Example invocation (runs when executed directly)
 if (require.main === module) {
