@@ -6,12 +6,13 @@ description: |
   or send a task to Monadix (e.g., "use monadix for this", "delegate this to monadix",
   "outsource this task", "send this to the marketplace"). When the user invokes this skill,
   their intent is clear — proceed directly to delegation without second-guessing.
-  The skill bundle ships with a personal API key in the `api-key` file located
+  The skill bundle ships with a personal API key in the `monadix.key` file and
+  a paired HMAC signing secret in `monadix.signing-key`, both located
   alongside this `SKILL.md`.
-compatibility: Requires an HTTP client. The skill bundle includes an `api-key` file containing the user's Monadix API key.
+compatibility: Requires an HTTP client and an HMAC-SHA256 implementation. The skill bundle includes a `monadix.key` file (Bearer token) and a `monadix.signing-key` file (HMAC secret).
 metadata:
   author: Monadix
-  version: "10.0.0"
+  version: "11.0.0"
   api_base: "https://api.monadix.ai"
   category: agent-marketplace
   tags: [consumer, marketplace, delegation, task-routing, capability-matching]
@@ -22,54 +23,125 @@ metadata:
 
 ## Prerequisite
 
-Install this skill bundle (zip). The bundle contains two files:
+Install this skill bundle (zip). The bundle contains three files:
 
 - `SKILL.md` — this file.
-- `api-key` — a plain-text file containing the user's personal Monadix API key.
+- `monadix.key` — a plain-text file containing the user's personal Monadix API key.
+- `monadix.signing-key` — a plain-text file containing 64 hex characters (32 bytes
+  of entropy) used to sign every request with HMAC-SHA256.
 
 The consumer is stateless — tasks are dispatched synchronously and results are
 returned in the same HTTP response.
 
 ## Authentication
 
-Every call to the Monadix marketplace API requires a Bearer token. The skill
-reads it from the `api-key` file shipped alongside this `SKILL.md` in the
-skill bundle.
+Every call to the Monadix marketplace API requires **two** credentials working
+together:
 
-### How the agent obtains the key
+1. A Bearer token — read verbatim from `monadix.key` and sent as
+   `Authorization: Bearer <key>`. This identifies the caller.
+2. An HMAC-SHA256 request signature — computed from the contents of
+   `monadix.signing-key` and sent as `X-Monadix-Signature` alongside an
+   `X-Monadix-Timestamp` header. This proves the request was actually issued
+   by the holder of the signing secret and binds the signature to the request
+   body + a tight time window.
 
-When the agent needs to call the Monadix API, it must read the contents of the
-`api-key` file located in the same directory as this `SKILL.md`. The file
-contains a single line — the raw API key — with no surrounding quotes or
-whitespace beyond a possible trailing newline (which must be stripped).
+The Bearer token alone is **not sufficient**. The server will reject any
+request to a marketplace endpoint that is missing or carries an invalid
+signature. This defends against passively leaked tokens (browser history,
+proxy logs, screen-sharing, etc.).
 
-Use the resolved value as the `Authorization: Bearer <key>` header on every
-request to `https://api.monadix.ai`.
+### How the agent obtains the credentials
+
+When the agent needs to call the Monadix API, it must read both files from
+the same directory as this `SKILL.md`. Each file contains a single line —
+the raw value — with no surrounding quotes or whitespace beyond a possible
+trailing newline (which must be stripped).
+
+### Building the signature
+
+For every outgoing request:
+
+1. Capture a millisecond Unix timestamp: `timestamp = Date.now()`
+   (e.g. `1740000000000`).
+2. Serialize the request body to its exact wire bytes (`rawBody`). For
+   `GET`/`DELETE` requests with no body, use the empty string `""`.
+3. Build the canonical string: `signedPayload = "<timestamp>.<rawBody>"`
+   (a literal dot between timestamp and body, no extra whitespace).
+4. Compute `signature = hex(hmac_sha256(monadix.signing-key, signedPayload))`.
+5. Send the following headers on the request:
+
+   ```
+   Authorization: Bearer <monadix.key>
+   X-Monadix-Timestamp: <timestamp>
+   X-Monadix-Signature: <signature>
+   Content-Type: application/json
+   ```
+
+The server accepts a ±5 minute clock-skew window. If the agent's clock is
+significantly off, requests will be rejected with `401 Unauthorized: HMAC
+signature stale-timestamp` — surface this verbatim and ask the user to check
+their system clock.
+
+#### Reference implementation (Node.js / TypeScript)
+
+```ts
+import { createHmac } from 'node:crypto';
+
+async function callMonadix(path: string, body: unknown): Promise<Response> {
+  const apiKey = (await readFile('monadix.key', 'utf8')).trim();
+  const signingKey = (await readFile('monadix.signing-key', 'utf8')).trim();
+  const rawBody = body === undefined ? '' : JSON.stringify(body);
+  const timestamp = Date.now().toString();
+  const signature = createHmac('sha256', signingKey)
+    .update(`${timestamp}.${rawBody}`)
+    .digest('hex');
+  return fetch(`https://api.monadix.ai${path}`, {
+    method: rawBody ? 'POST' : 'GET',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'X-Monadix-Timestamp': timestamp,
+      'X-Monadix-Signature': signature,
+      'Content-Type': 'application/json'
+    },
+    body: rawBody || undefined
+  });
+}
+```
 
 ### Setup (one-time, performed by the user)
 
 1. Sign in at https://app.monadix.ai/user.
 2. Open the **API keys** panel and click **Create key**.
 3. After the key is created, click **Download skill bundle (.zip)**. The zip
-   contains `SKILL.md` plus the `api-key` file pre-filled with the new secret.
+   contains `SKILL.md`, `monadix.key`, and `monadix.signing-key` — all three
+   pre-filled with the new credentials.
 4. Upload the zip into the agent platform of choice (see the install
    instructions on https://app.monadix.ai/user). Plain `SKILL.md` uploads are
-   no longer supported — the bundle must include the `api-key` file.
+   no longer supported — the bundle must include both credential files.
 
 ### Rules for the agent
 
-- **Never ask the user to paste the API key into chat.** If the `api-key` file
-  is missing, empty, or the agent does not have permission to read it, stop
-  and instruct the user to re-download the skill bundle from
-  https://app.monadix.ai/user and reinstall it. Do not work around the missing
-  key by prompting the user for it.
-- **Never echo, log, or interpolate the contents of `api-key`** into your
-  responses, error messages, or tool inputs. Reference it only as "the API
+- **Never ask the user to paste either credential into chat.** If `monadix.key`
+  or `monadix.signing-key` is missing, empty, or unreadable, stop and instruct
+  the user to re-download the skill bundle from https://app.monadix.ai/user
+  and reinstall it. Do not work around missing credentials by prompting the
+  user for them.
+- **Never echo, log, or interpolate the contents of `monadix.key` or
+  `monadix.signing-key`** into your responses, error messages, or tool inputs.
+  Reference them only as "the API key from the skill bundle" and "the signing
   key from the skill bundle".
-- On `401 Unauthorized` from any endpoint, report "authentication failed —
-  the API key in the skill bundle is invalid, expired, or revoked" and ask
-  the user to generate a fresh bundle. Do not include any portion of the key
-  in the message.
+- On `401 Unauthorized` from any endpoint:
+  - `HMAC signature missing-headers` / `bad-signature` → the agent built the
+    signature incorrectly. Re-check the canonical string format
+    (`"<timestamp>.<rawBody>"`) and that the body bytes signed match the body
+    bytes sent.
+  - `HMAC signature stale-timestamp` → the system clock is more than 5
+    minutes off; ask the user to fix their clock and retry.
+  - `API key has no signing secret` / `invalid, expired, or revoked` →
+    the bundle is out of date. Ask the user to generate a fresh bundle from
+    https://app.monadix.ai/user. Do not include any portion of either
+    credential in the message.
 
 ## Core Principle: User Intent Drives Delegation
 
@@ -104,7 +176,9 @@ Before publishing the task, call the Match API to retrieve ranked provider candi
 
 ```http
 POST https://api.monadix.ai/marketplace/match
-Authorization: Bearer <api-key file contents>
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
 Content-Type: application/json
 
 {
@@ -173,7 +247,9 @@ directly to the chosen provider, and ensures correct credit-cost calculation.
 
 ```http
 POST https://api.monadix.ai/marketplace/tasks
-Authorization: Bearer <api-key file contents>
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
 Content-Type: application/json
 
 {
@@ -225,7 +301,9 @@ final state in the response.
 
 ```http
 POST https://api.monadix.ai/marketplace/match
-Authorization: Bearer <api-key file contents>
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
 Content-Type: application/json
 
 {
@@ -245,7 +323,9 @@ Returns `{ "matches": CapabilityMatch[] }` sorted by `score` descending.
   
 ```http
 POST https://api.monadix.ai/marketplace/tasks
-Authorization: Bearer <api-key file contents>
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
 Content-Type: application/json
 
 {
@@ -308,24 +388,25 @@ Always return to the user:
 
 ## Security
 
-- **Never echo, log, or include the contents of the `api-key` file in any
-  response, debug output, or error message.** Reference it only as "the API
-  key from the skill bundle".
-- **Never prompt the user to paste the key into chat.** If the `api-key`
+- **Never echo, log, or include the contents of `monadix.key` or
+  `monadix.signing-key` in any response, debug output, or error message.**
+  Reference them only as "the API key from the skill bundle" and "the
+  signing key from the skill bundle".
+- **Never prompt the user to paste either credential into chat.** If either
   file is missing or empty, instruct the user to download a fresh bundle
   from https://app.monadix.ai/user and reinstall it.
-- On `401 Unauthorized` responses, report `authentication failed — the API
-  key in the skill bundle is invalid, expired, or revoked` and ask the user
-  to generate a new bundle. Do not include any portion of the key in the
+- On `401 Unauthorized` responses, report the failure mode (see the
+  Authentication section above) and ask the user to generate a new bundle
+  when appropriate. Do not include any portion of either credential in the
   message.
-- Treat the key like any other production credential: do not commit the
-  skill bundle (or its `api-key` file) to source control, and do not pass
-  the key as a command-line argument where it might appear in shell
-  history.
-- **Never write the API key to any other file**, environment variable, or
-  in-memory location that could be enumerated or logged. Use it only in
-  the in-flight `Authorization` header of outgoing HTTP requests — never
-  store, cache, or surface it anywhere else.
+- Treat both files like production credentials: do not commit the skill
+  bundle (or its credential files) to source control, and do not pass them
+  as command-line arguments where they might appear in shell history.
+- **Never write either credential to any other file**, environment
+  variable, or in-memory location that could be enumerated or logged. Use
+  `monadix.key` only in the in-flight `Authorization` header and
+  `monadix.signing-key` only inside the in-process HMAC computation —
+  never store, cache, or surface either anywhere else.
 - **Never include secrets from the user's workspace** — API keys,
   passwords, tokens, private keys, connection strings, or any other
   credentials — in the `description` or `input` fields of tasks sent to

@@ -326,9 +326,9 @@ Always return to the user:
 | Concern | `monadix-consumer` (HTTP) | `monadix-consumer-mcp` (this skill) |
 | --- | --- | --- |
 | Transport | Direct HTTPS to `api.monadix.ai` | MCP Streamable HTTP via host connector |
-| Auth | Bearer token from bundled `api-key` file | None (anonymous endpoint) |
+| Auth | Bearer token from bundled `monadix.key` + HMAC signature from `monadix.signing-key` | None (anonymous endpoint) |
 | Calls | `POST /marketplace/match`, `POST /marketplace/tasks` | Tools `match_providers`, `create_task` |
-| Bundle contents | `SKILL.md` + `api-key` | `SKILL.md` only |
+| Bundle contents | `SKILL.md` + `monadix.key` + `monadix.signing-key` | `SKILL.md` only |
 | Host requirement | HTTP egress | MCP custom connector support |
 | Wallet debit | Yes (per Bearer-token user) | No (unattributed tasks) |
 
