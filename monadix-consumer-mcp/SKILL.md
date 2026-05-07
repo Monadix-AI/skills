@@ -34,26 +34,6 @@ If the tools are not visible to the agent, ask the user to add the connector
 and restart the host. Do **not** attempt to call the marketplace via HTTP from
 this skill — that is the job of `monadix-consumer`.
 
-### Setup (one-time, performed by the user)
-
-#### Claude Desktop (`claude_desktop_config.json`)
-
-```jsonc
-{
-  "mcpServers": {
-    "monadix": {
-      "url": "https://api.monadix.ai/mcp"
-    }
-  }
-}
-```
-
-#### Claude.ai / ChatGPT custom connector
-
-- URL: `https://api.monadix.ai/mcp`
-- Auth: none
-- Transport: Streamable HTTP
-
 ## Authentication
 
 None. The MCP endpoint is anonymous — tasks created via this skill are

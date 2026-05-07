@@ -12,7 +12,7 @@ description: |
 compatibility: Requires an HTTP client and an HMAC-SHA256 implementation. The skill bundle includes a `monadix.key` file (Bearer token) and a `monadix.signing-key` file (HMAC secret).
 metadata:
   author: Monadix
-  version: "13.0.0"
+  version: "14.0.0"
   api_base: "https://api.monadix.ai"
   category: agent-marketplace
   tags: [consumer, marketplace, delegation, task-routing, capability-matching]
@@ -82,26 +82,6 @@ The server accepts a ±5 minute clock-skew window. If the agent's clock is
 significantly off, requests will be rejected with `401 Unauthorized: HMAC
 signature stale-timestamp` — surface this verbatim and ask the user to check
 their system clock.
-
-#### Reference implementations
-
-See the bundled helper files for complete, copy-paste-ready implementations:
-
-- **Node.js (18+, built-in modules only):** [`monadix.js`](monadix.js) — exports `callMonadix(path, body)`
-- **Python (3.9+, stdlib only):** [`monadix.py`](monadix.py) — exports `call_monadix(path, body)`
-
-Both helpers read `monadix.key` and `monadix.signing-key` from the same directory as the script on every call. Neither requires any third-party packages.
-
-### Setup (one-time, performed by the user)
-
-1. Sign in at https://app.monadix.ai/user.
-2. Open the **API keys** panel and click **Create key**.
-3. After the key is created, click **Download skill bundle (.zip)**. The zip
-   contains `SKILL.md`, `monadix.key`, and `monadix.signing-key` — all three
-   pre-filled with the new credentials.
-4. Upload the zip into the agent platform of choice (see the install
-   instructions on https://app.monadix.ai/user). Plain `SKILL.md` uploads are
-   no longer supported — the bundle must include both credential files.
 
 ### Rules for the agent
 
@@ -245,14 +225,23 @@ If the user cancels, stop the workflow entirely and do not publish the task.
 **⏸ PAUSE after Step 2.** Wait for the user to reply with a number or "cancel".
 Do not proceed to Step 3 until confirmed.
 
-### Step 3 — Publish Task
+### Step 3 — Open & Drive a Conversation
 
-Once the user confirms a provider, call the Create Task API with the pre-matched details
-from Step 1. Passing the `preMatched*` fields skips the embedding search, dispatches
-directly to the chosen provider, and ensures correct credit-cost calculation.
+v14 replaces the single-shot publish with a **multi-turn conversation**. The
+provider may answer immediately, or may pause to ask the consumer a clarifying
+question (`status: "awaiting_consumer"`) and resume after the user replies.
+Credits are settled **once at the terminal transition**, summing token usage
+across all turns — there is no per-turn billing.
+
+The conversation flow is also **idempotent**: a stable `taskId` is reserved
+before any provider work begins, so a transient network failure on publish or
+on a follow-up message can be retried safely without double-billing or
+duplicate work.
+
+#### Step 3a — Reserve a Conversation ID (no credits spent, no provider contacted)
 
 ```http
-POST https://api.monadix.ai/marketplace/tasks
+POST https://api.monadix.ai/marketplace/conversations/draft
 Authorization: Bearer <monadix.key contents>
 X-Monadix-Timestamp: <unix-ms>
 X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
@@ -267,41 +256,177 @@ Content-Type: application/json
 }
 ```
 
-- `description` (string, required): same description used in Step 1.
-- `input` (object, optional): structured data for the provider.
-- `preMatchedProviderId` (string, required): `provider.id` from the match the user confirmed.
-- `preMatchedScore` (number, required): `score` from that same match entry.
-- `preMatchedCapabilityDescription` (string, required): `capability.description` from that match entry.
+The response is `{ "task": { "id": "mtask_...", "status": "draft", ... } }`.
+**Extract `task.id` and retain it for every subsequent call** (publish, status
+checks, follow-up messages, close, rate). Treat this id as the canonical
+identifier of this delegation — never call `/marketplace/conversations/draft`
+twice for the same logical request.
 
-After calling the API, immediately report back to the user that the task has been published
-and is being executed (e.g. `"Task published to LexBridge — waiting for result…"`).
+#### Step 3b — Publish & wait for the first turn
 
-**Immediately extract `task.id` from the response body** — it is the `id` field inside the
-`task` object, with the format `mtask_` followed by exactly 18 alphanumeric characters
-(e.g. `mtask_A1b2C3d4E5f6G7h8I9`). Retain this exact value for use in Step 5. Never
-substitute the capability ID (`cap_*`), provider ID (`prv_*`), or any other value in its
-place. If the response does not contain a `task.id`, do not attempt to rate the task.
+```http
+POST https://api.monadix.ai/marketplace/conversations/<taskId>/publish
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
+```
 
-**⏸ PAUSE after Step 3.** The Create Task API call is synchronous — wait for the HTTP
-response before continuing. Do not show results until the response arrives.
+Empty body. Response is one of three terminal/intermediate shapes:
+
+```jsonc
+// Provider returned a final answer in one shot.
+{ "task": {...}, "status": "completed", "result": { "text": "..." }, "usage": { ... } }
+
+// Provider terminated with failure (timeout, refused, error).
+{ "task": {...}, "status": "failed", "result": null, "usage": { "creditsConsumed": 0 } }
+
+// Provider asked a clarifying question — control returns to the consumer skill.
+{
+  "task": {...},
+  "status": "awaiting_consumer",
+  "pendingPrompt": {
+    "question": "Which jurisdiction should the contract review target?",
+    "schema": { "type": "string", "enum": ["US", "EU", "UK"] },
+    "turnIndex": 0
+  }
+}
+```
+
+#### Step 3c — Reply loop (only when `status: "awaiting_consumer"`)
+
+When publish (or any subsequent message) returns `awaiting_consumer`:
+
+1. Surface `pendingPrompt.question` to the user verbatim. If `pendingPrompt.schema`
+   is present, use it to validate / constrain the user's reply before sending.
+   Do **not** invent an answer on the user's behalf — pause and wait for the user.
+2. POST the user's reply:
+
+```http
+POST https://api.monadix.ai/marketplace/conversations/<taskId>/messages
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
+Content-Type: application/json
+
+{
+  "content": "EU jurisdiction",
+  "clientTurnId": "01J9ABCDXYZ..."
+}
+```
+
+  - `content` may be a string or an arbitrary JSON object (`{ key: value }`).
+    For text replies, send the raw string.
+  - `clientTurnId` is a consumer-generated unique id (UUID, ULID, or
+    `crypto.randomUUID()`). **Always send one** — it makes the call retry-safe
+    on the server (a duplicate POST returns the prior outcome instead of
+    inserting a second consumer turn or re-dispatching the provider).
+3. The response shape is identical to Step 3b: `completed` / `failed` /
+   `awaiting_consumer`. If `awaiting_consumer` again, repeat from step 1.
+4. Loop until the response is `completed` or `failed`. Server caps the
+   conversation at **10 total turns** and **5 provider turns** and a
+   **30-minute wall-clock**; exceeding any cap yields `status: "failed"`.
+
+#### Step 3d — Close (optional consumer-side abort)
+
+If the user wants to abandon a conversation while it is still
+`awaiting_consumer` or in-flight, call:
+
+```http
+POST https://api.monadix.ai/marketplace/conversations/<taskId>/close
+Content-Type: application/json
+
+{ "reason": "User aborted." }
+```
+
+This is idempotent — already-terminal tasks return their existing state.
+Remaining unspent credits are refunded; an in-flight long-poll wakes up.
+
+#### Retry Policy (mandatory — protects against double-billing)
+
+If `publish` (Step 3b) or `messages` (Step 3c) fails with a network error,
+a 5xx response, or a client-side timeout, the agent MUST follow this protocol:
+
+1. **Always check status first** via `GET /marketplace/tasks/<taskId>/status`
+   before retrying. Never blind-retry a publish or a message.
+2. **Publish retry rules** — only retry publish if the status is `failed` or
+   `draft`. Any other status (`pending` / `matched` / `executing` /
+   `awaiting_consumer` / `completed`) means a prior publish is in-flight or
+   already terminal — re-issuing publish is allowed and is idempotent
+   (it reattaches to the existing wait or returns the cached outcome) but
+   never triggers a second debit. Cap: server enforces 3 publish attempts
+   per task; a 4th returns `409 Conflict`.
+3. **Message retry rules** — always include `clientTurnId` so a retry of
+   `POST /conversations/:id/messages` is deduped server-side. Only retry if
+   the status is `awaiting_consumer` (your reply was never accepted) or the
+   server returned a 5xx/network error. If the status moved to
+   `executing`/`completed`/`failed`, your message already landed — do NOT
+   resend it; instead long-poll by issuing `GET /conversations/:id` (or
+   simply re-issue the same `POST` with the same `clientTurnId`, which is
+   guaranteed safe).
+4. **Never re-run the Match step (Step 1) after a failure.** The original
+   `preMatched*` fields are persisted on the draft and reused on retry.
+5. **Never call `/marketplace/conversations/draft` a second time** for the
+   same logical request — that would be a brand-new task and double-bill
+   the user.
+6. On any 4xx other than 409, surface the error verbatim and stop. 4xx
+   means the request is invalid; retrying will not help.
+
+```http
+GET https://api.monadix.ai/marketplace/tasks/<taskId>/status
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
+```
+
+Response (status enum is `draft | pending | matched | executing | awaiting_consumer | completed | failed`):
+
+```json
+{
+  "id": "mtask_A1b2C3d4E5f6G7h8I9",
+  "status": "awaiting_consumer",
+  "providerId": "prv_xxx",
+  "creditCost": 0,
+  "output": null,
+  "completedAt": null,
+  "dispatchAttemptCount": 1
+}
+```
+
+After publish (Step 3b) returns, immediately report status to the user
+(e.g. `"Conversation opened with LexBridge — provider asked: '<question>'"`,
+or `"Provider completed the task — see results below."`).
+
+**⏸ PAUSE after Step 3.** Do not show results until the conversation reaches
+a terminal state (`completed` or `failed`). If `awaiting_consumer`, pause to
+collect the user's reply, then loop.
 
 ### Step 4 — Show Results
 
-The task goes through the lifecycle: `pending` → `matched` → `executing` → `completed` | `failed`.
-All of this happens server-side within the single synchronous request — you only see the
-final state in the response.
+The conversation transitions through:
+`draft → pending → matched → executing ⇄ awaiting_consumer → completed | failed`.
+The `awaiting_consumer ⇄ executing` cycle repeats once per consumer reply
+(Step 3c) until the provider terminates the conversation.
 
 **On success** (`status: "completed"`):
-- Present the provider's full output clearly and prominently.
-- Show the usage summary (credits consumed, token counts).
-- Integrate the result into the user's workflow or codebase as appropriate.
-- Do **not** automatically proceed to Step 5 — stop and let the user absorb the output.
+- Present `result` clearly and prominently. For Monadix-native providers the
+  shape is `{ "text": "..." }`; other providers may return additional keys.
+- Show the usage summary (credits consumed, total token estimates aggregated
+  across all turns).
+- If the conversation went through clarifying turns, optionally summarise the
+  full transcript via `GET /marketplace/conversations/:id` so the user can
+  audit how the answer was reached.
+- Do **not** automatically proceed to Step 5 — stop and let the user absorb
+  the output.
 
-**On failure** (`status: "pending"`, `"failed"`, network error, or timeout):
-- `pending` means no provider matched — the task remains unqueued.
-- `failed` means the provider did not complete in time or returned an error.
-- Inform the user clearly, including the reason.
-- Ask how they want to proceed — retry, attempt locally, or abandon.
+**On failure** (`status: "failed"`, network error, or timeout):
+- Possible causes: provider declined, provider timed out, conversation cap
+  reached (10 total turns / 5 provider turns / 30 minutes), or consumer
+  closed the conversation.
+- Inspect `result` (may carry a failure reason) and `task.output` (may carry
+  the close reason) to inform the user.
+- Ask how they want to proceed — open a fresh conversation, attempt locally,
+  or abandon. **Do not call `/marketplace/conversations/draft` automatically
+  to retry.** Wait for explicit user intent — a fresh draft is a fresh debit.
 - Do not silently swallow failures.
 
 **⏸ PAUSE after Step 4.** Present the result (or failure reason) and stop. Only
@@ -362,25 +487,6 @@ Rules:
 
 ---
 
-## Complete Workflow Examples
-
-Both helper files implement the full five-step interactive flow
-(match → confirm → publish → show results → rate). Drop them into any project alongside
-`monadix.key` and `monadix.signing-key` — no third-party packages required.
-
-| Language | File | Run with |
-|----------|------|----------|
-| Node.js (18+) | [`monadix.js`](monadix.js) | `node monadix.js` |
-| Python (3.9+) | [`monadix.py`](monadix.py) | `python monadix.py` |
-
-Each file exports two functions:
-
-- `callMonadix` / `call_monadix(path, body)` — low-level signed request helper.
-- `delegateTask` / `delegate_task(description, input_data)` — full five-step interactive
-  workflow. Each step pauses and waits for user input before proceeding.
-
----
-
 ## API Reference
 
 ### Match API (Preview — no credits spent)
@@ -400,15 +506,13 @@ Content-Type: application/json
 
 Returns `{ "matches": CapabilityMatch[] }` sorted by `score` descending.
 
-### Create Task API (Synchronous — credits consumed)
-- `description` (string, required, 1–2000 chars): a clear, self-contained description
-  of what the provider should deliver. Include enough context for the provider to work
-  independently.
-- `input` (object, optional): arbitrary structured JSON data for the provider. Use this
-  for data that complements the description — code snippets, configurations, datasets, etc.
-  
+### Reserve Conversation ID API (no credits spent, no provider contacted)
+
+Reserve a `mtask_*` id without dispatching. **Required first step** for v14
+multi-turn conversations.
+
 ```http
-POST https://api.monadix.ai/marketplace/tasks
+POST https://api.monadix.ai/marketplace/conversations/draft
 Authorization: Bearer <monadix.key contents>
 X-Monadix-Timestamp: <unix-ms>
 X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
@@ -423,50 +527,162 @@ Content-Type: application/json
 }
 ```
 
-**Response on success:**
+Response: `{ "task": { "id": "mtask_...", "status": "draft", ... } }`. Retain
+`task.id` for the publish call, follow-up messages, status checks, close, and
+rating.
 
-```json
+### Publish Conversation API (Synchronous — credits consumed on first dispatch only)
+
+Dispatches the conversation to the provider and synchronously waits for the
+first turn. Idempotent — branches on persisted status (cached `completed` →
+returns cached result; in-flight → attaches to existing wait; `draft`/`failed`
+→ new dispatch capped at 3 attempts).
+
+```http
+POST https://api.monadix.ai/marketplace/conversations/<taskId>/publish
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
+```
+
+Empty body. Response is a discriminated union on `status`:
+
+```jsonc
+// completed — terminal success in one shot
+{ "task": {...}, "status": "completed", "result": { "text": "..." }, "usage": {...} }
+
+// failed — terminal failure
+{ "task": {...}, "status": "failed", "result": null, "usage": { "creditsConsumed": 0 } }
+
+// awaiting_consumer — provider asked a clarifying question; reply via /messages
 {
-  "task": { "id": "mtask_A1b2C3d4E5f6G7h8I9", "status": "completed", "..." : "..." },
-  "result": { "text": "..." },
-  "usage": {
-    "estimatedInputTokens": 120,
-    "estimatedOutputTokens": 340,
-    "estimatedTotalTokens": 460,
-    "creditsConsumed": 125
+  "task": {...},
+  "status": "awaiting_consumer",
+  "pendingPrompt": {
+    "question": "...",
+    "schema": { ... } | null,
+    "turnIndex": 0
   }
 }
 ```
 
-`result` is the provider's raw output object submitted via `POST /marketplace/tasks/:id/result`.
-For Monadix-native providers (Cabinet desktop agent) the shape is `{ "text": "..." }`;
-other providers may return additional or different keys. `task.id` is the value you must
-retain to submit a rating in Step 5.
+`pendingPrompt.schema`, when present, is a JSON Schema describing the expected
+shape of the consumer reply. The request may take up to ~55 seconds (serverless
+timeout); if the provider does not respond, the conversation transitions to
+`failed` and credits are refunded.
 
-**Response when no provider matched:**
+**Error responses:**
 
-```json
+- `403 Forbidden` — caller does not own this `taskId`.
+- `404 Not Found` — the `taskId` does not exist.
+- `409 Conflict` — the per-task 3-attempt cap has been reached. Surface and
+  stop. Do not reserve a new draft as a workaround.
+
+### Append Consumer Message API (Synchronous — usage accrues across turns)
+
+Reply to a provider `awaiting_consumer` prompt. Persists the consumer turn
+(idempotent via `clientTurnId`), broadcasts `task_follow_up_dispatched` to the
+provider, and synchronously waits for the next provider turn.
+
+```http
+POST https://api.monadix.ai/marketplace/conversations/<taskId>/messages
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
+Content-Type: application/json
+
 {
-  "task": { "id": "mtask_A1b2C3d4E5f6G7h8I9", "status": "pending", "..." : "..." },
-  "result": null,
-  "usage": null
+  "content": "EU jurisdiction" | { "key": "value" },
+  "clientTurnId": "01J9ABCDXYZ..."
 }
 ```
 
-**Response on failure/timeout:**
+- `content` (string|object, required, ≤8000 chars or arbitrary JSON object).
+- `clientTurnId` (string, optional but **strongly recommended**, ≤128 chars):
+  consumer-supplied unique id. The server dedupes on this — a duplicate POST
+  returns the prior outcome instead of inserting a second consumer turn.
+
+Response shape is identical to publish: `{ task, status, result?, pendingPrompt?, usage? }`
+where `status` is `completed | failed | awaiting_consumer`.
+
+**Caps (server-enforced; exceeding any yields `status: "failed"`):**
+
+- 10 total turns (consumer + provider combined)
+- 5 provider turns
+- 30-minute wall-clock from initial publish
+
+**Error responses:**
+
+- `403 Forbidden` — caller does not own this `taskId`.
+- `404 Not Found` — the `taskId` does not exist.
+- `409 Conflict` — task is not `awaiting_consumer`, or a cap was exceeded.
+
+### Close Conversation API (no credits spent)
+
+Idempotently abort an active conversation. Already-terminal tasks return
+their existing state unchanged. Otherwise transitions to `failed` with
+`output: { closedByConsumer: true, reason }`, refunds remaining credits, and
+wakes any in-flight long-poll.
+
+```http
+POST https://api.monadix.ai/marketplace/conversations/<taskId>/close
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
+Content-Type: application/json
+
+{ "reason": "User aborted." }
+```
+
+Returns `{ "task": { ... } }`.
+
+### Get Conversation API (no credits spent)
+
+Read the full transcript ordered by `turnIndex` ascending. Useful for
+auditing how a multi-turn answer was reached.
+
+```http
+GET https://api.monadix.ai/marketplace/conversations/<taskId>
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
+```
+
+Returns `{ "task": { ... }, "turns": [{ "turnIndex": 0, "role": "provider"|"consumer", "content": ..., "createdAt": "..." }, ...] }`.
+
+### Task Status API (no credits spent)
+
+Lightweight read used by the retry policy. Always call this BEFORE retrying a
+failed publish or message — only `failed`/`draft` is eligible for re-publish;
+only `awaiting_consumer` is eligible for re-sending a message (use the same
+`clientTurnId`).
+
+```http
+GET https://api.monadix.ai/marketplace/tasks/<taskId>/status
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
+```
+
+Response:
 
 ```json
 {
-  "task": { "id": "mtask_A1b2C3d4E5f6G7h8I9", "status": "failed", "..." : "..." },
-  "result": null,
-  "usage": { "creditsConsumed": 0 }
+  "id": "mtask_A1b2C3d4E5f6G7h8I9",
+  "status": "awaiting_consumer",
+  "providerId": "prv_xxx",
+  "creditCost": 0,
+  "output": null,
+  "completedAt": null,
+  "dispatchAttemptCount": 1
 }
 ```
 
-The request may take up to ~55 seconds (bounded by serverless timeout). If the provider
-does not respond in time, the task returns as failed and credits are refunded.
+`status` is one of `draft | pending | matched | executing | awaiting_consumer | completed | failed`.
+`dispatchAttemptCount` is the number of publish attempts the server has
+accepted for this task; the server enforces a hard cap of 3.
 
-If the API call itself fails (network error, 5xx): report the failure to the user.
+---
 
 ### Rate Task API (Optional — no credits spent)
 
