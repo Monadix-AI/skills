@@ -8,8 +8,10 @@ description: |
   "send this to the marketplace") AND the host supports MCP custom connectors
   (Claude Desktop, Claude.ai, ChatGPT, Cursor, etc.). When the user invokes this skill,
   their intent is clear — proceed directly to delegation without second-guessing.
-  This skill requires no API key; it relies on the configured `monadix` MCP server.
-compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, anonymous). No HTTP client and no API key needed.
+  Authentication is handled by the host's MCP connector via OAuth — the user signs
+  into their Monadix account through the connector setup flow; this skill never
+  handles tokens directly.
+compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, OAuth-authenticated). The host connector negotiates the Bearer token; this skill never sees or attaches credentials itself.
 metadata:
   author: Monadix
   version: "2.0.0"
@@ -47,9 +49,22 @@ this skill — that is the job of `monadix-consumer`.
 
 ## Authentication
 
-None. The MCP endpoint is anonymous — tasks created via this skill are
-unattributed and no wallet is debited. Never ask the user for an API key, and
-never attempt to attach a Bearer token to MCP tool calls from this skill.
+The MCP endpoint **requires** Bearer authentication (Clerk session token or
+Clerk user-scoped API key). Authentication is handled entirely by the host's
+MCP connector — when the user first adds the `monadix` connector, the host
+performs an OAuth 2.0 flow (RFC 9728 protected-resource discovery) to sign
+the user into their Monadix account and obtain a token. The host then attaches
+that token to every MCP tool call automatically.
+
+**This skill never handles tokens directly.** Do not ask the user for an API
+key, do not attempt to attach `Authorization` headers from skill code, and do
+not inspect or log connector credentials.
+
+Tasks created through this skill are **attributed to the signed-in user** and
+**debit that user's Monadix wallet** — exactly the same billing model as the
+HTTP `monadix-consumer` skill. If tool calls fail with an authentication error
+(e.g. `-32001` / `Unauthorized`), instruct the user to re-authenticate the
+`monadix` connector in their host application; do not work around it.
 
 ## Core Principle: User Intent Drives Delegation
 
@@ -99,10 +114,11 @@ description leads to better matches and higher quality results.
 Call the MCP tool `match_providers` to retrieve ranked candidates. **No task
 is created and no credits are spent at this step.**
 
-Tool call:
+Tool call (the MCP tool name is the bare `match_providers`; `monadix` is the
+connector/server label, not part of the JSON-RPC `name` field):
 
 ```jsonc
-// tool: monadix.match_providers
+// tool: match_providers   (server: monadix)
 {
   "description": "Task description (same text you will use in Step 4)",
   "limit": 5
@@ -180,7 +196,7 @@ logical request** — doing so creates a brand-new task and would double-bill.
 Tool call:
 
 ```jsonc
-// tool: monadix.reserve_conversation
+// tool: reserve_conversation   (server: monadix)
 {
   "description": "Task description (max 2000 chars)",
   "input": { "key": "value" },
@@ -198,7 +214,7 @@ Extract `task.id` and retain it.
 #### Step 5a — Publish & wait for the first turn
 
 ```jsonc
-// tool: monadix.publish_conversation
+// tool: publish_conversation   (server: monadix)
 { "taskId": "mtask_..." }
 ```
 
@@ -235,7 +251,7 @@ When `publish_conversation` (or any subsequent `send_message`) returns
 2. Send the user's reply:
 
    ```jsonc
-   // tool: monadix.send_message
+   // tool: send_message   (server: monadix)
    {
      "taskId": "mtask_...",
      "content": "EU jurisdiction",
@@ -263,7 +279,7 @@ If the user wants to abandon a conversation while it is still
 `awaiting_consumer` or in-flight, call:
 
 ```jsonc
-// tool: monadix.close_conversation
+// tool: close_conversation   (server: monadix)
 { "taskId": "mtask_...", "reason": "User aborted." }
 ```
 
@@ -299,7 +315,7 @@ error, a 5xx-equivalent, or a tool timeout, follow this protocol:
    stop. The request is invalid; retrying will not help.
 
 ```jsonc
-// tool: monadix.get_task_status
+// tool: get_task_status   (server: monadix)
 { "taskId": "mtask_..." }
 ```
 
@@ -565,10 +581,15 @@ they verify the connector configuration.
 Always return to the user:
 
 - Which provider was selected and at what match score
-- Current task lifecycle state (`completed`, `pending`, or `failed`)
+- Current task lifecycle state (one of `draft | pending | matched | executing | awaiting_consumer | completed | failed`)
 - Result data (on success) or failure reason (on failure)
 - Usage summary (credits consumed) when available
 - Clear next-step recommendation
+
+**Rating note:** This MCP skill does **not** expose a `rate_task` tool. If the
+user wants to leave a 1–5 star rating for a completed task, tell them ratings
+are available only via the HTTP `monadix-consumer` skill or the Monadix web
+dashboard — do not fabricate a tool call.
 
 ## Security
 
@@ -605,12 +626,13 @@ Always return to the user:
 | Concern | `monadix-consumer` (HTTP) | `monadix-consumer-mcp` (this skill) |
 | --- | --- | --- |
 | Transport | Direct HTTPS to `api.monadix.ai` | MCP Streamable HTTP via host connector |
-| Auth | Bearer token from bundled `monadix.key` + HMAC signature from `monadix.signing-key` | None (anonymous endpoint) |
-| Calls | `POST /marketplace/match`, `POST /marketplace/tasks` | Tools `match_providers`, `create_task` |
+| Auth | Bearer token from bundled `monadix.key` + HMAC signature from `monadix.signing-key` | Bearer token negotiated by host MCP connector via OAuth 2.0 — skill never handles tokens |
+| Calls | `POST /marketplace/match`, `POST /marketplace/conversations/*`, `POST /marketplace/tasks/:id/rate` | Tools `match_providers`, `reserve_conversation`, `publish_conversation`, `send_message`, `close_conversation`, `get_conversation`, `get_task_status`, `create_task` (legacy) |
 | Bundle contents | `SKILL.md` + `monadix.key` + `monadix.signing-key` | `SKILL.md` only |
-| Host requirement | HTTP egress | MCP custom connector support |
-| Wallet debit | Yes (per Bearer-token user) | No (unattributed tasks) |
+| Host requirement | HTTP egress | MCP custom connector support + OAuth login to Monadix |
+| Wallet debit | Yes (per Bearer-token user) | Yes (per OAuth-signed-in user) |
+| Rating support | Yes (`POST /marketplace/tasks/:id/rate`) | **No** — no `rate_task` tool exposed |
 
 If the host has both skills installed, prefer this MCP skill when the host
-restricts arbitrary HTTP egress, and prefer `monadix-consumer` when wallet
-attribution / authenticated quota matters.
+restricts arbitrary HTTP egress, and prefer `monadix-consumer` when you need
+in-skill rating submission or HMAC-bound request integrity.

@@ -333,6 +333,9 @@ If the user wants to abandon a conversation while it is still
 
 ```http
 POST https://api.monadix.ai/marketplace/conversations/<taskId>/close
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
 Content-Type: application/json
 
 { "reason": "User aborted." }
@@ -690,7 +693,7 @@ Submit a 1–5 star rating for a completed task you previously created. Ratings 
 immutable: once a task has been rated, further attempts return `409 Conflict`.
 
 ```http
-POST https://api.monadix.ai/marketplace/tasks/<task.id from the POST /marketplace/tasks response>/rate
+POST https://api.monadix.ai/marketplace/tasks/<task.id from the conversations/draft or publish response>/rate
 Authorization: Bearer <monadix.key contents>
 X-Monadix-Timestamp: <unix-ms>
 X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
@@ -725,7 +728,7 @@ continue. Do not retry automatically.
 
 Always return to the user:
 - Which provider was selected and at what match score
-- Current task lifecycle state (`completed`, `pending`, or `failed`)
+- Current task lifecycle state (one of `draft | pending | matched | executing | awaiting_consumer | completed | failed`)
 - Result data (on success) or failure reason (on failure)
 - Usage summary (credits consumed) when available
 - Rating submission status — whether a 1–5 star rating was recorded, skipped, or
