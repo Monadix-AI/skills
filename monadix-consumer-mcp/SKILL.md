@@ -14,7 +14,7 @@ description: |
 compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, OAuth-authenticated). The host connector negotiates the Bearer token; this skill never sees or attaches credentials itself.
 metadata:
   author: Monadix
-  version: "2.0.0"
+  version: "3.0.0"
   mcp_endpoint: "https://api.monadix.ai/mcp"
   mcp_server_name: "monadix"
   category: agent-marketplace
@@ -366,6 +366,45 @@ until the provider terminates the conversation.
   Wait for explicit user intent — a fresh draft is a fresh debit.
 - Do not silently swallow failures.
 
+### Step 7 — Rate (Completed Tasks Only)
+
+After presenting results and letting the user absorb them, prompt for an
+optional 1–5 star rating. Ratings are immutable and feed the public
+leaderboard plus the provider's own dashboard.
+
+Example prompt:
+
+```
+[Step 6 complete — Results delivered]
+
+Would you like to rate this provider's work? (1–5 stars, or "skip")
+```
+
+If the user supplies a digit 1–5, call:
+
+```jsonc
+// tool: rate_task   (server: monadix)
+{
+  "taskId": "mtask_...",
+  "rating": 4
+}
+```
+
+Rules:
+
+- **Only call `rate_task` after the user explicitly replies with a digit 1–5.**
+  Do not auto-submit a rating, do not invent one on the user's behalf, and do
+  not call the tool for any other input ("skip", blank, text, etc.).
+- Only completed tasks are eligible. Skip Step 7 entirely if the task is
+  `failed`.
+- The server returns `409` if already rated — treat that as already-rated
+  and surface a single-line acknowledgement.
+- A `400`/`403`/`404` response is a soft error — surface a single-line
+  acknowledgement (e.g. `"Rating not recorded: <reason>"`) and continue
+  the conversation.
+
+**⏸ PAUSE after Step 7.** The workflow is now complete.
+
 ### Delegation Granularity
 
 - **Full-task**: the entire user request is delegated.
@@ -547,6 +586,28 @@ Output:
 `dispatchAttemptCount` is the number of publish attempts the server has
 accepted for this task; the server enforces a hard cap of 3.
 
+### `rate_task` (no credits spent)
+
+Submit a 1–5 star rating for a completed task. Immutable — each task can be
+rated only once.
+
+Input:
+
+```json
+{
+  "taskId": "string (required)",
+  "rating": "integer 1–5 (required)"
+}
+```
+
+Output: `{ "task": { ... } }` on success.
+
+Error responses (`isError: true`):
+
+- `403` — caller does not own this task.
+- `404` — task not found.
+- `409` — already rated, or task is not `completed`.
+
 ### `create_task` (Legacy single-shot — deprecated, no follow-up turns)
 
 The pre-v14 single-call flow. Kept for backwards compatibility. Does not
@@ -586,10 +647,9 @@ Always return to the user:
 - Usage summary (credits consumed) when available
 - Clear next-step recommendation
 
-**Rating note:** This MCP skill does **not** expose a `rate_task` tool. If the
-user wants to leave a 1–5 star rating for a completed task, tell them ratings
-are available only via the HTTP `monadix-consumer` skill or the Monadix web
-dashboard — do not fabricate a tool call.
+**Rating:** After showing results for a completed task, always offer the user a
+1–5 star rating prompt (Step 7). Only submit via `rate_task` if the user
+explicitly provides a digit.
 
 ## Security
 
