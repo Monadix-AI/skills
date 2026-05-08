@@ -69,7 +69,7 @@ def call_monadix(path: str, body: dict | None = None) -> dict:
     Credentials are read fresh from disk on every call — never cached.
 
     Args:
-        path: API path, e.g. '/marketplace/match'
+        path: API path, e.g. '/network/match'
         body: Request payload (will be JSON-serialised); None → empty body
 
     Returns:
@@ -95,7 +95,7 @@ def rate_task(task_id: str, rating: int) -> str | None:
     Returns None on success or a string error message on a 4xx soft failure.
     """
     try:
-        call_monadix(f"/marketplace/tasks/{task_id}/rate", {"rating": rating})
+        call_monadix(f"/network/tasks/{task_id}/rate", {"rating": rating})
         return None
     except (MonadixAPIError, urllib.error.URLError) as err:
         return str(err)
@@ -147,7 +147,7 @@ def _run_with_retry(task_id: str, attempt_fn, label: str, can_retry_on_status) -
             print(f"{label} attempt {attempt} failed (network). Checking task status before retry...")
 
         try:
-            snap = get_monadix(f"/marketplace/tasks/{task_id}/status")
+            snap = get_monadix(f"/network/tasks/{task_id}/status")
             verdict = can_retry_on_status(snap)
             if verdict == "abort":
                 print(f"Task is {snap.get('status')} — not eligible for {label} retry. Aborting.")
@@ -176,7 +176,7 @@ def publish_conversation(task_id: str) -> dict | None:
 
     return _run_with_retry(
         task_id,
-        lambda: call_monadix(f"/marketplace/conversations/{task_id}/publish"),
+        lambda: call_monadix(f"/network/conversations/{task_id}/publish"),
         "Publish",
         _verdict,
     )
@@ -200,7 +200,7 @@ def respond_to_provider(task_id: str, content, client_turn_id: str | None = None
     return _run_with_retry(
         task_id,
         lambda: call_monadix(
-            f"/marketplace/conversations/{task_id}/messages",
+            f"/network/conversations/{task_id}/messages",
             {"content": content, "clientTurnId": turn_id},
         ),
         "Message",
@@ -212,7 +212,7 @@ def close_conversation(task_id: str, reason: str | None = None) -> dict:
     """Idempotently close a conversation. Safe to call multiple times."""
     body = {"reason": reason} if reason else {}
     try:
-        return call_monadix(f"/marketplace/conversations/{task_id}/close", body)
+        return call_monadix(f"/network/conversations/{task_id}/close", body)
     except (MonadixAPIError, urllib.error.URLError) as err:
         return {"error": str(err)}
 
@@ -232,7 +232,7 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
     """
     # Step 1 — Match: find providers (no credits spent)
     print("Matching providers...")
-    data = call_monadix("/marketplace/match", {"description": description, "limit": 5})
+    data = call_monadix("/network/match", {"description": description, "limit": 5})
     matches = data.get("matches", [])
     if not matches:
         print("No providers available for this task.")
@@ -269,7 +269,7 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
     }
     if input_data is not None:
         draft_payload["input"] = input_data
-    draft = call_monadix("/marketplace/conversations/draft", draft_payload)
+    draft = call_monadix("/network/conversations/draft", draft_payload)
     task_id = draft["task"]["id"]
     print(f"Conversation reserved: {task_id}. Publishing...")
 

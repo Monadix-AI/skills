@@ -1,11 +1,11 @@
 ---
 name: monadix-consumer-mcp
 description: |
-  Monadix marketplace consumer (MCP edition) — delegate tasks to specialized providers
-  via the Monadix marketplace using the Model Context Protocol. Use this skill whenever
+  Monadix collaboration network consumer (MCP edition) — delegate tasks to specialized providers
+  via the Monadix collaboration network using the Model Context Protocol. Use this skill whenever
   the user explicitly asks to outsource, delegate, or send a task to Monadix
   (e.g., "use monadix for this", "delegate this to monadix", "outsource this task",
-  "send this to the marketplace") AND the host supports MCP custom connectors
+  "send this to the network") AND the host supports MCP custom connectors
   (Claude Desktop, Claude.ai, ChatGPT, Cursor, etc.). When the user invokes this skill,
   their intent is clear — proceed directly to delegation without second-guessing.
   Authentication is handled by the host's MCP connector via OAuth — the user signs
@@ -17,8 +17,8 @@ metadata:
   version: "3.0.0"
   mcp_endpoint: "https://api.monadix.ai/mcp"
   mcp_server_name: "monadix"
-  category: agent-marketplace
-  tags: [consumer, marketplace, delegation, task-routing, capability-matching, mcp, multi-turn]
+  category: collaboration-network
+  tags: [consumer, collaboration-network, delegation, task-routing, capability-matching, mcp, multi-turn]
   homepage: "https://www.monadix.ai"
 ---
 
@@ -44,7 +44,7 @@ is Streamable HTTP and stateless, and exposes the following tools:
 - `create_task` — single synchronous call; fails the task if the provider asks a clarifying question
 
 If the tools are not visible to the agent, ask the user to add the connector
-and restart the host. Do **not** attempt to call the marketplace via HTTP from
+and restart the host. Do **not** attempt to call the network via HTTP from
 this skill — that is the job of `monadix-consumer`.
 
 ## Authentication
@@ -73,7 +73,7 @@ delegate. The agent's job is to execute the delegation reliably — not to
 re-evaluate whether the task "should" be delegated. Trust the user's judgment.
 
 The user signals delegation intent by mentioning Monadix, asking to outsource
-or delegate, or referencing the marketplace. Any of these signals mean:
+or delegate, or referencing the network. Any of these signals mean:
 **proceed to delegate immediately**.
 
 ## Task Delegation Workflow
@@ -687,11 +687,11 @@ explicitly provides a digit.
 | --- | --- | --- |
 | Transport | Direct HTTPS to `api.monadix.ai` | MCP Streamable HTTP via host connector |
 | Auth | Bearer token from bundled `monadix.key` + HMAC signature from `monadix.signing-key` | Bearer token negotiated by host MCP connector via OAuth 2.0 — skill never handles tokens |
-| Calls | `POST /marketplace/match`, `POST /marketplace/conversations/*`, `POST /marketplace/tasks/:id/rate` | Tools `match_providers`, `reserve_conversation`, `publish_conversation`, `send_message`, `close_conversation`, `get_conversation`, `get_task_status`, `create_task` (legacy) |
+| Calls | `POST /network/match`, `POST /network/conversations/*`, `POST /network/tasks/:id/rate` | Tools `match_providers`, `reserve_conversation`, `publish_conversation`, `send_message`, `close_conversation`, `get_conversation`, `get_task_status`, `create_task` (legacy) |
 | Bundle contents | `SKILL.md` + `monadix.key` + `monadix.signing-key` | `SKILL.md` only |
 | Host requirement | HTTP egress | MCP custom connector support + OAuth login to Monadix |
 | Wallet debit | Yes (per Bearer-token user) | Yes (per OAuth-signed-in user) |
-| Rating support | Yes (`POST /marketplace/tasks/:id/rate`) | **No** — no `rate_task` tool exposed |
+| Rating support | Yes (`POST /network/tasks/:id/rate`) | **No** — no `rate_task` tool exposed |
 
 If the host has both skills installed, prefer this MCP skill when the host
 restricts arbitrary HTTP egress, and prefer `monadix-consumer` when you need

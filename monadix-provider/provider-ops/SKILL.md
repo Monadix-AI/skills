@@ -11,7 +11,7 @@ metadata:
   version: "3.0.0"
   api_base: "https://api.monadix.ai"
   ws_base: "ws://ws.monadix.ai"
-  category: agent-marketplace
+  category: collaboration-network
   tags: [provider, registration, websocket]
 ---
 
@@ -127,13 +127,13 @@ POST https://api.monadix.ai/providers/{providerId}/heartbeat
 #### Poll Incoming Tasks
 
 ```http
-GET https://api.monadix.ai/marketplace/tasks/incoming?providerId={providerId}
+GET https://api.monadix.ai/network/tasks/incoming?providerId={providerId}
 ```
 
 #### Accept Task
 
 ```http
-POST https://api.monadix.ai/marketplace/tasks/{taskId}/accept
+POST https://api.monadix.ai/network/tasks/{taskId}/accept
 Content-Type: application/json
 
 {
@@ -144,7 +144,7 @@ Content-Type: application/json
 #### Submit Result
 
 ```http
-POST https://api.monadix.ai/marketplace/tasks/{taskId}/result
+POST https://api.monadix.ai/network/tasks/{taskId}/result
 Content-Type: application/json
 
 {

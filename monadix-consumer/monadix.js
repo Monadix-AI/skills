@@ -26,7 +26,7 @@ function prompt(rl, question) {
  * Send a signed POST request to the Monadix API.
  * Credentials are read fresh from disk on every call — never cached.
  *
- * @param {string} apiPath - API path, e.g. '/marketplace/match'
+ * @param {string} apiPath - API path, e.g. '/network/match'
  * @param {object} body    - Request payload (will be JSON-serialised)
  * @returns {Promise<object>} Parsed JSON response body
  */
@@ -103,7 +103,7 @@ async function getMonadix(apiPath) {
  */
 async function rateTask(taskId, rating) {
   try {
-    await callMonadix('/marketplace/tasks/' + encodeURIComponent(taskId) + '/rate', { rating: rating });
+    await callMonadix('/network/tasks/' + encodeURIComponent(taskId) + '/rate', { rating: rating });
     return null;
   } catch (err) {
     return String(err && err.message ? err.message : err);
@@ -170,7 +170,7 @@ async function runWithRetry(taskId, attemptFn, label, canRetryOnStatus) {
       }
       console.log(label + ' attempt ' + attempt + ' failed (' + (status || 'network') + '). Checking task status before retry...');
       try {
-        var snap = await getMonadix('/marketplace/tasks/' + encodeURIComponent(taskId) + '/status');
+        var snap = await getMonadix('/network/tasks/' + encodeURIComponent(taskId) + '/status');
         var verdict = canRetryOnStatus(snap);
         if (verdict === 'abort') {
           console.log('Task is ' + snap.status + ' — not eligible for ' + label + ' retry. Aborting.');
@@ -199,7 +199,7 @@ async function runWithRetry(taskId, attemptFn, label, canRetryOnStatus) {
 async function publishConversation(taskId) {
   return runWithRetry(
     taskId,
-    function () { return callMonadix('/marketplace/conversations/' + encodeURIComponent(taskId) + '/publish'); },
+    function () { return callMonadix('/network/conversations/' + encodeURIComponent(taskId) + '/publish'); },
     'Publish',
     function (snap) {
       if (snap.status === 'completed' || snap.status === 'failed') return 'attached';
@@ -224,7 +224,7 @@ async function respondToProvider(taskId, content, clientTurnId) {
     taskId,
     function () {
       return callMonadix(
-        '/marketplace/conversations/' + encodeURIComponent(taskId) + '/messages',
+        '/network/conversations/' + encodeURIComponent(taskId) + '/messages',
         { content: content, clientTurnId: turnId }
       );
     },
@@ -250,7 +250,7 @@ async function respondToProvider(taskId, content, clientTurnId) {
 async function closeConversation(taskId, reason) {
   try {
     var body = reason ? { reason: reason } : {};
-    return await callMonadix('/marketplace/conversations/' + encodeURIComponent(taskId) + '/close', body);
+    return await callMonadix('/network/conversations/' + encodeURIComponent(taskId) + '/close', body);
   } catch (err) {
     return { error: String(err && err.message ? err.message : err) };
   }
@@ -273,7 +273,7 @@ async function closeConversation(taskId, reason) {
 async function delegateTask(description, inputData) {
   // Step 1 — Match: find providers (no credits spent)
   console.log('Matching providers...');
-  var matchData = await callMonadix('/marketplace/match', { description: description, limit: 5 });
+  var matchData = await callMonadix('/network/match', { description: description, limit: 5 });
   var matches = matchData.matches;
   if (!matches.length) {
     console.log('No providers available for this task.');
@@ -318,7 +318,7 @@ async function delegateTask(description, inputData) {
   if (inputData !== undefined) {
     draftPayload.input = inputData;
   }
-  var draft = await callMonadix('/marketplace/conversations/draft', draftPayload);
+  var draft = await callMonadix('/network/conversations/draft', draftPayload);
   var taskId = draft.task.id;
   console.log('Conversation reserved: ' + taskId + '. Publishing...');
 

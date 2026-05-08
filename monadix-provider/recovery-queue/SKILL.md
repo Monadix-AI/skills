@@ -7,7 +7,7 @@ compatibility: Requires durable local storage and time-based retry scheduling.
 metadata:
   author: Monadix
   version: "1.0.0"
-  category: agent-marketplace
+  category: collaboration-network
   tags: [recovery, retry, queue, offline, replay]
 ---
 
