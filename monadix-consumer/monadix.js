@@ -284,7 +284,10 @@ async function delegateTask(description, inputData) {
   console.log('\n[Step 1 complete — Match results]');
   console.log('\nFound ' + matches.length + ' provider(s):');
   matches.forEach(function (m, i) {
-    console.log((i + 1) + '. ' + m.provider.name + ' (' + Math.round(m.score * 100) + '% match)');
+    var ratingStr = (m.provider.averageRating != null && m.provider.ratingCount > 0)
+      ? ('\u2605 ' + Number(m.provider.averageRating).toFixed(1) + ' (' + m.provider.ratingCount + ' rating' + (m.provider.ratingCount === 1 ? '' : 's') + ')')
+      : 'No ratings yet';
+    console.log((i + 1) + '. ' + m.provider.name + ' (' + Math.round(m.score * 100) + '% match)  ' + ratingStr);
     console.log('   Capability: ' + m.capability.description);
   });
 
@@ -362,7 +365,11 @@ async function delegateTask(description, inputData) {
 
     // Step 5 — Rate (completed only)
     var rl2 = readline.createInterface({ input: process.stdin, output: process.stdout });
-    var ratingAnswer = await prompt(rl2, '\n[Step 5 — Rate] Rate this provider (1–5, or "skip"): ');
+    var providerName = chosen.provider.name;
+    console.log('\n[Step 5 — Rate this provider]');
+    console.log('How would you rate ' + providerName + '\'s work on this task? (1–5 stars)');
+    console.log('\u2605 1 = Poor   \u2605 3 = Good   \u2605 5 = Excellent');
+    var ratingAnswer = await prompt(rl2, 'Enter a number 1–5, or "skip": ');
     rl2.close();
     var rating = parseInt(String(ratingAnswer).trim(), 10);
     if (rating >= 1 && rating <= 5) {

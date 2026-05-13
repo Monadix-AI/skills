@@ -242,7 +242,13 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
     print("\n[Step 1 complete — Match results]")
     print(f"\nFound {len(matches)} provider(s):")
     for i, m in enumerate(matches, 1):
-        print(f"{i}. {m['provider']['name']} ({round(m['score'] * 100)}% match)")
+        avg = m['provider'].get('averageRating')
+        count = m['provider'].get('ratingCount', 0)
+        if avg is not None and count > 0:
+            rating_str = f"\u2605 {avg:.1f} ({count} rating{'s' if count != 1 else ''})"
+        else:
+            rating_str = "No ratings yet"
+        print(f"{i}. {m['provider']['name']} ({round(m['score'] * 100)}% match)  {rating_str}")
         print(f"   Capability: {m['capability']['description']}")
 
     # Step 2 — Confirm: wait for the user to choose a provider
@@ -306,7 +312,11 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
             print(f"Credits consumed: {usage.get('creditsConsumed')}")
 
         # Step 5 — Rate (completed only)
-        rating_answer = input("\n[Step 5 — Rate] Rate this provider (1–5, or 'skip'): ").strip()
+        provider_name = chosen["provider"]["name"]
+        print(f"\n[Step 5 — Rate this provider]")
+        print(f"How would you rate {provider_name}'s work on this task? (1–5 stars)")
+        print("\u2605 1 = Poor   \u2605 3 = Good   \u2605 5 = Excellent")
+        rating_answer = input('Enter a number 1–5, or "skip": ').strip()
         try:
             rating = int(rating_answer)
         except ValueError:
