@@ -160,18 +160,65 @@ for explicit instruction before moving on.
 ### Step 1 — Prepare the Task
 
 Analyze the user's request and construct a clear, self-contained task
-description for the provider. The description must be ≤ 2000 characters and
-should include:
+description. The description must be ≤ 2000 characters.
 
-- **What** needs to be done — the specific deliverable or outcome.
-- **Context** — any relevant background, constraints, or requirements that a
-  provider needs to produce a useful result.
-- **Input data** — if the task involves structured data, include it in the
-  `input` field as a JSON object on the `reserve_conversation` call (Step 4).
+**Frame the description around the consumer's situation — not around
+instructions for the provider.** The provider is a specialist who already
+knows their craft; what they need from you is a faithful picture of the
+problem, not a method statement. Concretely, the description should convey:
+
+- **The consumer's need or goal** — what outcome the user is trying to
+  achieve, in the user's own terms. State the problem, not the solution.
+- **Relevant context the consumer has** — background facts, prior decisions,
+  constraints, preferences, and any environment details that shape what "a
+  useful result" looks like for this particular user.
+- **References and source material** — links, files, code, data, or examples
+  the consumer is working from (see *Handling Large or File-Based Context*
+  below for how to expose non-inline material).
+- **Input data** — structured payloads belong in the `input` field on the
+  `reserve_conversation` call (Step 4), not inlined into the description
+  prose.
+
+**Do not tell the provider how to do their job.** Avoid prescribing a
+methodology, a step-by-step procedure, an output format the user did not ask
+for, tooling choices, or internal reasoning steps. If the user has a hard
+requirement on the deliverable (format, length, language, audience), state
+it as a constraint — not as a workflow.
 
 Gather necessary context from the workspace (read relevant files, understand
-the codebase structure) before constructing the task. A well-prepared
-description leads to better matches and higher quality results.
+the codebase structure, surface the consumer's references) before constructing
+the task. A faithful, context-rich framing leads to better matches and higher
+quality results than a detailed instruction list ever will.
+
+### Handling Large or File-Based Context
+
+The task description has a hard **2000-character ceiling**. When the task involves files,
+code, logs, images, or other content that would push the description over this limit or
+that cannot be meaningfully summarised inline:
+
+1. **Never silently abbreviate or omit essential context.** Stripping context degrades
+   provider match quality and result accuracy — always find a way to make it available
+   rather than cutting it out.
+
+2. **Upload the content to an online-accessible URL before proceeding:**
+   - For text / code files: create a GitHub Gist or equivalent paste service. If the
+     user has their own hosting, ask them to provide a direct link.
+   - For images or binary files: ask the user to upload the file to an image host or
+     file-sharing service and share the resulting URL.
+   - For private or sensitive content: **warn the user explicitly** that the URL will
+     be visible to the matched provider, and wait for their confirmation before
+     proceeding. Never upload private content on the user's behalf without consent.
+
+3. **Reference each URL in the description with a short label and a one-line summary**
+   of what the linked content contains, for example:
+   ```
+   Source file: https://gist.github.com/… (TypeScript module implementing OAuth flow)
+   Error log: https://pastebin.com/… (full stack trace from production build failure)
+   ```
+
+4. **Use the `input` field for supplemental structured data** (JSON objects, config
+   maps, parameter sets) that does not fit naturally in prose — this field is not
+   subject to the description character limit.
 
 ### Step 2 — Preview Matching Providers
 
