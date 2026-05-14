@@ -14,7 +14,7 @@ description: |
 compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, OAuth-authenticated). The host connector negotiates the Bearer token; this skill never sees or attaches credentials itself.
 metadata:
   author: Monadix
-  version: "16.0.0"
+  version: "16.1.0"
   mcp_endpoint: "https://api.monadix.ai/mcp"
   mcp_server_name: "monadix"
   category: collaboration-network
@@ -159,66 +159,103 @@ for explicit instruction before moving on.
 
 ### Step 1 — Prepare the Task
 
-Analyze the user's request and construct a clear, self-contained task
-description. The description must be ≤ 2000 characters.
+A delegation involves **two distinct descriptions** built at different stages of the
+workflow. Treat them as two different artifacts with different purposes — do not reuse
+the same string for both.
 
-**Frame the description around the consumer's situation — not around
-instructions for the provider.** The provider is a specialist who already
-knows their craft; what they need from you is a faithful picture of the
-problem, not a method statement. Concretely, the description should convey:
+| Stage | Tool | Purpose | Detail level | Hard limit |
+| --- | --- | --- | --- | --- |
+| **Step 2 — Match description** | `match_providers` | Help the discovery layer find the right specialists. | **Moderate / concise** — a clear one-paragraph problem framing. | ≤ 2000 chars |
+| **Step 4 — Publish description** | `reserve_conversation` | Give the chosen provider everything they need to do the work. | **As thorough as possible** — full context, references, constraints, and any source material the provider will need. | ≤ 2000 chars |
 
-- **The consumer's need or goal** — what outcome the user is trying to
-  achieve, in the user's own terms. State the problem, not the solution.
+Why the split: the match step is a similarity search over capabilities — extra detail
+in the query (file dumps, long source excerpts, edge-case enumerations) actually
+*hurts* match quality by drowning the core intent in noise. The publish step, by
+contrast, is the only chance to brief the provider on the real job; under-describing
+here wastes the user's credits on a poorly-scoped run.
+
+**Frame both descriptions around the consumer's situation — not around instructions
+for the provider.** The provider is a specialist who already knows their craft; what
+they need from you is a faithful picture of the problem, not a method statement.
+
+**The match description (Step 2) should convey, briefly:**
+
+- The consumer's need or goal in one or two sentences — what outcome the user is
+  trying to achieve, in the user's own terms.
+- The high-level domain / kind of work involved (e.g. "legal contract review",
+  "TypeScript refactor", "data extraction from PDFs").
+- Any single hard constraint that meaningfully narrows the field of qualified
+  providers (e.g. language, jurisdiction, framework). Skip everything else.
+- Do **not** paste source material, full file contents, long error logs, or exhaustive
+  acceptance criteria into the match description.
+
+**The publish description (Step 4) should convey, in full:**
+
+- **The consumer's need or goal** — restated with the precision needed to actually
+  execute. State the problem, not the solution.
 - **Relevant context the consumer has** — background facts, prior decisions,
-  constraints, preferences, and any environment details that shape what "a
-  useful result" looks like for this particular user.
-- **References and source material** — links, files, code, data, or examples
-  the consumer is working from (see *Handling Large or File-Based Context*
-  below for how to expose non-inline material).
+  constraints, preferences, environment details, and anything that shapes what
+  "a useful result" looks like for this particular user.
+- **References and source material** — links, files, code, data, or examples the
+  consumer is working from (see *Handling Large or File-Based Context* below for how
+  to expose non-inline material).
+- **Acceptance criteria / hard requirements** the user has stated (format, length,
+  language, audience, deliverable shape).
 - **Input data** — structured payloads belong in the `input` field on the
-  `reserve_conversation` call (Step 4), not inlined into the description
-  prose.
+  `reserve_conversation` call (Step 4), not inlined into the description prose.
 
-**Do not tell the provider how to do their job.** Avoid prescribing a
-methodology, a step-by-step procedure, an output format the user did not ask
-for, tooling choices, or internal reasoning steps. If the user has a hard
-requirement on the deliverable (format, length, language, audience), state
-it as a constraint — not as a workflow.
+**Do not tell the provider how to do their job.** Avoid prescribing a methodology, a
+step-by-step procedure, an output format the user did not ask for, tooling choices, or
+internal reasoning steps. State requirements as constraints — not as a workflow.
 
-Gather necessary context from the workspace (read relevant files, understand
-the codebase structure, surface the consumer's references) before constructing
-the task. A faithful, context-rich framing leads to better matches and higher
-quality results than a detailed instruction list ever will.
+Gather necessary context from the workspace (read relevant files, understand the
+codebase structure, surface the consumer's references) before constructing the publish
+description. A faithful, context-rich publish briefing leads to higher quality results
+than a detailed instruction list ever will.
 
 ### Handling Large or File-Based Context
 
-The task description has a hard **2000-character ceiling**. When the task involves files,
-code, logs, images, or other content that would push the description over this limit or
-that cannot be meaningfully summarised inline:
+The **publish description** has a hard **2000-character ceiling**, but the **`input`
+field on `reserve_conversation` has no length restriction** — it is a JSON payload
+designed to carry arbitrary structured data alongside the description.
+
+Use the following rules of thumb when context exceeds what fits comfortably in the
+description:
 
 1. **Never silently abbreviate or omit essential context.** Stripping context degrades
-   provider match quality and result accuracy — always find a way to make it available
-   rather than cutting it out.
+   result accuracy — always find a way to make it available rather than cutting it out.
 
-2. **Upload the content to an online-accessible URL before proceeding:**
-   - For text / code files: create a GitHub Gist or equivalent paste service. If the
-     user has their own hosting, ask them to provide a direct link.
+2. **First, prefer the `input` field for structured supplemental data** — JSON
+   objects, config maps, parameter sets, moderately-sized text blobs, arrays of
+   records, code snippets that fit reasonably in a payload. The field has no schema
+   length cap, so use it freely instead of trying to cram structured data into the
+   description prose.
+
+3. **For *very large* or *binary* content, upload to a publicly-accessible URL
+   instead of embedding it.** Even though `input` accepts arbitrary length, payloads
+   measured in megabytes (entire repositories, full log archives, video / audio /
+   image files, large PDFs, binary blobs) should not be inlined — they bloat the task
+   record, slow every transport hop, and may exceed practical request-body limits at
+   the network layer. In these cases:
+   - For text / code that exceeds a few hundred KB, or for whole files: create a
+     GitHub Gist or equivalent paste service. If the user has their own hosting, ask
+     them to provide a direct link.
    - For images or binary files: ask the user to upload the file to an image host or
      file-sharing service and share the resulting URL.
    - For private or sensitive content: **warn the user explicitly** that the URL will
      be visible to the matched provider, and wait for their confirmation before
      proceeding. Never upload private content on the user's behalf without consent.
 
-3. **Reference each URL in the description with a short label and a one-line summary**
-   of what the linked content contains, for example:
+4. **Reference each URL in the publish description (or in `input`) with a short label
+   and a one-line summary** of what the linked content contains, for example:
    ```
    Source file: https://gist.github.com/… (TypeScript module implementing OAuth flow)
    Error log: https://pastebin.com/… (full stack trace from production build failure)
    ```
 
-4. **Use the `input` field for supplemental structured data** (JSON objects, config
-   maps, parameter sets) that does not fit naturally in prose — this field is not
-   subject to the description character limit.
+5. **The match description (Step 2) should never carry uploaded URLs or large
+   payloads.** Save those for the publish step (Step 4) — they are noise to the
+   discovery layer.
 
 ### Step 2 — Preview Matching Providers
 
@@ -231,14 +268,16 @@ connector/server label, not part of the JSON-RPC `name` field):
 ```jsonc
 // tool: match_providers   (server: monadix)
 {
-  "description": "Task description (same text you will use in Step 4)",
+  "description": "Concise one-paragraph problem framing (the *match* description)",
   "limit": 5
 }
 ```
 
 Arguments:
 
-- `description` (string, required, 1–2000 chars): same description prepared in Step 1.
+- `description` (string, required, 1–2000 chars): the **match description** prepared
+  in Step 1 — moderate detail, no large payloads, no inlined files. The richer
+  publish description is sent later in Step 4.
 - `limit` (integer, optional, 1–20, default 5): how many candidates to return.
 - `excludeProviderId` (string, optional): skip a specific provider if needed.
 
@@ -339,13 +378,26 @@ Tool call:
 ```jsonc
 // tool: reserve_conversation   (server: monadix)
 {
-  "description": "Task description (max 2000 chars)",
+  "description": "Full publish description — as thorough as possible, ≤ 2000 chars",
   "input": { "key": "value" },
   "preMatchedProviderId": "<provider.id from the confirmed match>",
   "preMatchedScore": 0.94,
   "preMatchedCapabilityDescription": "<capability.description from the confirmed match>"
 }
 ```
+
+Arguments:
+
+- `description` (string, required, 1–2000 chars): the **publish description** — the
+  rich, context-complete briefing the provider will actually work from. This is *not*
+  the same string as the match description; reuse the matching intent but expand it
+  with full context, references, and acceptance criteria. Aim to use the available
+  characters generously — under-describing here wastes credits.
+- `input` (object, optional, **no length limit**): arbitrary structured JSON payload.
+  Put any supplemental data, structured parameters, moderately-sized text blobs, or
+  reference URLs here. For very large or binary content, upload to a public URL and
+  reference the URL instead of inlining the bytes (see *Handling Large or File-Based
+  Context*).
 
 Response `structuredContent`: `{ "task": { "id": "mtask_...", "status": "draft", ... } }`.
 Extract `task.id` and retain it.
