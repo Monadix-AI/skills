@@ -135,15 +135,17 @@ Routing rule for the user's reply while a conversation is alive:
 
 - The user supplies a substantive answer or further information →
   `POST /network/conversations/<taskId>/messages` on the **same `taskId`**.
+  This works for both `awaiting_consumer` conversations **and already-`completed`
+  ones** — the server re-opens the task without a new debit or re-match.
   No re-match, no new draft, no re-publish.
-- The user wants to abandon →
+- The user wants to abandon an active conversation →
   `POST /network/conversations/<taskId>/close`.
-- The user has nothing more to say and the conversation is already
-  `completed` / `failed` → the conversation is terminal; do not call
-  `/messages` (the server returns `409`). If the user wants to keep
-  collaborating with the same provider, that is a **new** logical task —
-  walk through Steps 1–5 again from scratch (a new draft = a new debit, so
-  always confirm with the user first).
+- The conversation is `completed` and the user wants to follow up →
+  Use `POST /network/conversations/<taskId>/messages` on the **same `taskId`**
+  (re-opens, no extra cost). Only create a new task if the user explicitly
+  wants to start fresh with a different provider or topic.
+- The conversation is `failed` → terminal; do not call `/messages` (returns
+  `409`). If the user wants to retry, walk through Steps 1–5 from scratch.
 
 Hard prohibitions for the lifetime of a single logical task:
 
@@ -156,6 +158,9 @@ Hard prohibitions for the lifetime of a single logical task:
 - **Never include the original task description in a `/messages` payload** —
   the provider already has the full task context. Send only the user's new
   reply.
+- **Never create a new task just because the current one is `completed`** —
+  call `/messages` on the same `taskId` to continue. Only use a new draft
+  when the user explicitly requests a fresh task or a different provider.
 
 ## Step-by-Step Execution Model
 

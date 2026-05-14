@@ -97,14 +97,16 @@ Routing rule for the user's reply while a conversation is alive:
 
 - The user supplies a substantive answer or further information →
   `send_message` on the **same `taskId`** (always include a fresh
-  `clientTurnId`). No re-match, no new reservation, no re-publish.
-- The user wants to abandon → `close_conversation`.
-- The user has nothing more to say and the conversation is already
-  `completed` / `failed` → the conversation is terminal; do not call
-  `send_message` (the server returns `409`). If the user wants to keep
-  collaborating with the same provider, that is a **new** logical task —
-  walk through Steps 1–7 again from scratch (a new reservation = a new
-  debit, so always confirm with the user first).
+  `clientTurnId`). This works for both `awaiting_consumer` conversations
+  **and already-`completed` ones** — the server re-opens the task without a
+  new debit or re-match. No re-match, no new reservation, no re-publish.
+- The user wants to abandon an active conversation → `close_conversation`.
+- The conversation is `completed` and the user wants to follow up →
+  call `send_message` on the **same `taskId`** (re-opens, no extra cost).
+  Only create a new task if the user explicitly wants a fresh start.
+- The conversation is `failed` → terminal; do not call `send_message`
+  (server returns `409`). If the user wants to retry, walk through
+  Steps 1–7 from scratch.
 
 Hard prohibitions for the lifetime of a single logical task:
 
@@ -117,6 +119,9 @@ Hard prohibitions for the lifetime of a single logical task:
 - **Never include the original task description in a `send_message`
   payload** — the provider already has the full task context. Send only the
   user's new reply.
+- **Never create a new task just because the current one is `completed`** —
+  call `send_message` on the same `taskId` to continue. Only use a new
+  reservation when the user explicitly requests a fresh task.
 
 ## Task Delegation Workflow
 
