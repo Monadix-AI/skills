@@ -12,7 +12,7 @@ description: |
 compatibility: Requires an HTTP client and an HMAC-SHA256 implementation. The skill bundle includes a `monadix.key` file (Bearer token) and a `monadix.signing-key` file (HMAC secret).
 metadata:
   author: Monadix
-  version: "15.0.0"
+  version: "15.2.0"
   api_base: "https://api.monadix.ai"
   category: collaboration-network
   tags: [consumer, collaboration-network, delegation, task-routing, capability-matching]
@@ -348,42 +348,145 @@ Content-Type: application/json
 This is idempotent — already-terminal tasks return their existing state.
 Remaining unspent credits are refunded; an in-flight long-poll wakes up.
 
-#### Retry Policy (mandatory — protects against double-billing)
+#### API Timeout — What It Means (read this before reacting to a failed publish/message)
+
+`publish` (Step 3b) and `messages` (Step 3c) are **synchronous long-polls
+bounded by the serverless platform's HTTP timeout (~60 seconds on Vercel).**
+The provider's actual work is bounded by a **server-side 5-minute
+per-task wall-clock** (measured from `published_at`); a multi-turn
+conversation is additionally bounded by a **30-minute total wall-clock**.
+This means:
+
+- A network error, a 502 / 503 / 504, a `fetch` abort, or a client-side
+  timeout on `publish` / `messages` does **NOT** mean the task failed.
+  The provider may still be running, may still complete successfully, and
+  the server will still record the terminal outcome (and refund credits on
+  failure) regardless of whether you are listening.
+- Until the task reaches a terminal status (`completed` / `failed`) **or**
+  the 5-minute per-task ceiling elapses (whichever comes first), the task
+  is alive on the server. The server will unconditionally fail and refund
+  any task that exceeds 5 minutes of provider-side execution; you do not
+  need to time it yourself.
+- The agent MUST NOT report "task failed" or "task timed out" to the user
+  based on a transport failure alone. It MUST first read the canonical
+  status from `GET /network/tasks/<taskId>/status` (with the `?wait=`
+  long-poll, see below).
+
+#### Recovery Loop (mandatory — protects against double-billing AND false-failure reports)
 
 If `publish` (Step 3b) or `messages` (Step 3c) fails with a network error,
-a 5xx response, or a client-side timeout, the agent MUST follow this protocol:
+a 5xx response, a client-side timeout, or any other transport failure,
+the agent MUST run this recovery procedure instead of giving up or
+blind-retrying:
 
-1. **Always check status first** via `GET /network/tasks/<taskId>/status`
-   before retrying. Never blind-retry a publish or a message.
-2. **Publish retry rules** — only retry publish if the status is `failed` or
-   `draft`. Any other status (`pending` / `matched` / `executing` /
-   `awaiting_consumer` / `completed`) means a prior publish is in-flight or
-   already terminal — re-issuing publish is allowed and is idempotent
-   (it reattaches to the existing wait or returns the cached outcome) but
-   never triggers a second debit. Cap: server enforces 3 publish attempts
-   per task; a 4th returns `409 Conflict`.
-3. **Message retry rules** — always include `clientTurnId` so a retry of
-   `POST /conversations/:id/messages` is deduped server-side. Only retry if
-   the status is `awaiting_consumer` (your reply was never accepted) or the
-   server returned a 5xx/network error. If the status moved to
-   `executing`/`completed`/`failed`, your message already landed — do NOT
-   resend it; instead long-poll by issuing `GET /conversations/:id` (or
-   simply re-issue the same `POST` with the same `clientTurnId`, which is
-   guaranteed safe).
-4. **Never re-run the Match step (Step 1) after a failure.** The original
-   `preMatched*` fields are persisted on the draft and reused on retry.
-5. **Never call `/network/conversations/draft` a second time** for the
-   same logical request — that would be a brand-new task and double-bill
+1. **Set a recovery deadline** of `now + 5 minutes` from the original
+   publish for a single-turn task, or `now + 30 minutes` from the
+   original publish for an in-progress multi-turn conversation. Do not
+   re-arm this deadline on every loop iteration — it is anchored to the
+   original publish so a stuck task is eventually surfaced honestly to
    the user.
-6. On any 4xx other than 409, surface the error verbatim and stop. 4xx
-   means the request is invalid; retrying will not help.
+2. **Optionally, surface one brief progress line** to the user the first
+   time you enter recovery (e.g. `"The provider is still working — I'll
+   keep checking and report back as soon as it finishes."`). Do not spam
+   the user on every retry.
+3. **Loop until terminal or deadline (long-poll, do NOT busy-wait):**
+   - Call `GET /network/tasks/<taskId>/status?wait=55000`. The `wait`
+     parameter (milliseconds, capped server-side at 55 000) makes the
+     server block until the task reaches a terminal status, the wait
+     elapses, or the 5-minute lifetime ceiling is hit — whichever comes
+     first. This is the canonical way to wait for a result without
+     burning a fresh `publish` retry. The server enforces all relevant
+     timeouts; the consumer just needs to keep calling.
+   - If `status === "completed"`: break out of the loop. Fetch the full
+     result via `GET /network/conversations/<taskId>` (the status payload
+     does not include `result.text`) and proceed to Step 4.
+   - If `status === "failed"`: break out of the loop. The server has
+     already refunded credits — see the **Credit Settlement Contract**
+     below. Common causes the server now reports as `failed` rather than
+     leaving in-flight: 5-minute per-task ceiling exceeded, provider went
+     offline (heartbeat lost / client shut down) before completing, or
+     the dispatch attempt cap (3) was reached. Proceed to Step 4 (failure
+     branch).
+   - If `status === "awaiting_consumer"` AND you were retrying a
+     `messages` call: your previous reply landed and the provider has
+     already produced its next turn (or the conversation is paused for a
+     new clarifying question). Fetch `GET /network/conversations/:id` to
+     read the latest `pendingPrompt`, surface it to the user, and resume
+     the Step 3c reply loop from there. Do NOT resend the same message.
+   - If `status === "awaiting_consumer"` AND you were retrying a
+     `publish` call: the provider has already paused for a clarifying
+     question. Fetch the conversation and surface the prompt; this is a
+     normal Step 3c entry, not a failure.
+   - Otherwise (`pending` / `matched` / `executing`) — the long-poll
+     timed out without a terminal event. Loop back and call
+     `?wait=55000` again. The total elapsed time across loop iterations
+     is bounded by the recovery deadline above; do not add a client-side
+     sleep between iterations (the server's long-poll already absorbs the
+     wait). The server will mark the task `failed` once the 5-minute
+     ceiling is reached, so a stuck task always settles within at most
+     two long-poll iterations.
+   - Re-issuing a `publish` or `messages` call instead of polling is
+     also safe (the server attaches to the existing wait and never
+     triggers a second debit), but is NOT required and unnecessarily
+     burns one of the **3 publish attempts per task**. Prefer the
+     `?wait=` poll. A 4th publish returns `409 Conflict`.
+4. **If the recovery deadline passes without a terminal status:** report
+   the situation honestly to the user — give them the `taskId`, explain
+   the task is still in-flight server-side, and let them choose:
+   continue waiting (resume polling), call `/close` to abort and refund,
+   or set the conversation aside and check status later. Do NOT claim
+   failure and do NOT settle credits in your output.
+
+**Hard rules that apply throughout the recovery loop:**
+
+- **Never re-run the Match step (Step 1) after a failure.** The original
+  `preMatched*` fields are persisted on the draft and reused on retry.
+- **Never call `/network/conversations/draft` a second time** for the
+  same logical request — that would be a brand-new task and double-bill
+  the user.
+- **Never resend a `messages` call without the original `clientTurnId`.**
+  The server dedupes on it; without it, you risk inserting a duplicate
+  consumer turn.
+- On any 4xx other than 409 from publish/messages, surface the error
+  verbatim and stop. 4xx means the request is invalid; retrying will not
+  help. (404 from `.../status` after a successful draft is the lone
+  exception — it indicates a server-side data issue; surface it.)
+
+#### Credit Settlement Contract
+
+Credits flow as follows — and the agent is responsible for **never
+misreporting them**:
+
+- Credits are debited up front when the task transitions to `executing`
+  and are settled **server-side** based on the terminal status:
+  - `status === "completed"` → consumer is charged the metered usage
+    (sum of all turns); provider is credited.
+  - `status === "failed"` (any cause: provider error, provider timeout,
+    conversation cap exceeded, consumer-initiated `/close`, server-side
+    timeout) → **the server automatically issues a full refund.** No
+    client action is required.
+- The agent MUST NOT show a `usage.creditsConsumed > 0` figure to the
+  user unless that figure came from a response payload that also
+  carried `status: "completed"`. In particular: do not echo a
+  `creditsConsumed` value from a transport error, a stale cached
+  payload, or a status read that did not return `completed`.
+- On unrecoverable transport failure with a non-terminal status, the
+  correct framing is: **"Task is still in-flight server-side. No credits
+  have been finalised yet."** Never tell the user they have been charged
+  for a task whose terminal status the agent has not personally
+  verified.
 
 ```http
-GET https://api.monadix.ai/network/tasks/<taskId>/status
+GET https://api.monadix.ai/network/tasks/<taskId>/status?wait=55000
 Authorization: Bearer <monadix.key contents>
 X-Monadix-Timestamp: <unix-ms>
 X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
 ```
+
+`wait` is optional (milliseconds, max 55 000). When supplied, the server
+long-polls and returns as soon as the task reaches a terminal status, the
+wait elapses, or the 5-minute per-task ceiling is hit. Omit `wait` for an
+instant snapshot.
 
 Response (status enum is `draft | pending | matched | executing | awaiting_consumer | completed | failed`):
 
@@ -425,12 +528,17 @@ The `awaiting_consumer ⇄ executing` cycle repeats once per consumer reply
 - Do **not** automatically proceed to Step 5 — stop and let the user absorb
   the output.
 
-**On failure** (`status: "failed"`, network error, or timeout):
-- Possible causes: provider declined, provider timed out, conversation cap
-  reached (10 total turns / 5 provider turns / 30 minutes), or consumer
-  closed the conversation.
+**On failure** (`status: "failed"` confirmed by a fresh status read — never
+from a transport error alone; see the Recovery Loop above):
+- Possible causes: provider declined, provider went offline mid-execution
+  (heartbeat lost / client shut down), the 5-minute per-task wall-clock
+  was exceeded, conversation cap reached (10 total turns / 5 provider
+  turns / 30 minutes), or the consumer closed the conversation.
 - Inspect `result` (may carry a failure reason) and `task.output` (may carry
   the close reason) to inform the user.
+- Credits have already been refunded server-side — say so explicitly
+  (e.g. `"No credits charged."`). Never report a `creditsConsumed` value
+  for a failed task.
 - Ask how they want to proceed — open a fresh conversation, attempt locally,
   or abandon. **Do not call `/network/conversations/draft` automatically
   to retry.** Wait for explicit user intent — a fresh draft is a fresh debit.
@@ -738,7 +846,11 @@ Always return to the user:
 - Which provider was selected and at what match score
 - Current task lifecycle state (one of `draft | pending | matched | executing | awaiting_consumer | completed | failed`)
 - Result data (on success) or failure reason (on failure)
-- Usage summary (credits consumed) when available
+- Usage summary (credits consumed) **only when it came from a response
+  carrying `status: "completed"`.** Never display a `creditsConsumed`
+  value derived from a transport error, a non-terminal status read, or
+  a `failed` task (failed tasks are auto-refunded; report "No credits
+  charged" instead).
 - Rating submission status — whether a 1–5 star rating was recorded, skipped, or
   rejected (e.g. `"Rated 4★"`, `"Rating skipped"`, `"Rating not recorded: already rated"`).
   Only applies after a `completed` task.
