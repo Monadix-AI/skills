@@ -14,7 +14,7 @@ description: |
 compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, OAuth-authenticated). The host connector negotiates the Bearer token; this skill never sees or attaches credentials itself.
 metadata:
   author: Monadix
-  version: "4.4.0"
+  version: "16.0.0"
   mcp_endpoint: "https://api.monadix.ai/mcp"
   mcp_server_name: "monadix"
   category: collaboration-network
@@ -29,15 +29,15 @@ metadata:
 The host application must have the `monadix` MCP server registered. The server
 is Streamable HTTP and stateless, and exposes the following tools:
 
-**Match → confirm → multi-turn conversation (recommended for v14+):**
+**Match → confirm → fire-and-forget publish → long-poll status (v16+):**
 
 - `match_providers` — preview ranked providers (no credits)
 - `reserve_conversation` — reserve a stable `mtask_*` id (no credits, no provider contacted)
-- `publish_conversation` — dispatch and wait for the first turn
-- `send_message` — reply to an `awaiting_consumer` prompt (idempotent via `clientTurnId`)
+- `publish_conversation` — **fire-and-forget** dispatch; returns immediately with the current snapshot
+- `send_message` — **fire-and-forget** reply to an `awaiting_consumer` prompt (idempotent via `clientTurnId`)
+- `get_task_status` — **primary loop endpoint** — long-poll snapshot (via `waitMs`) carrying `result` / `pendingPrompt`
 - `close_conversation` — abort an active conversation (idempotent)
 - `get_conversation` — read the full transcript
-- `get_task_status` — lightweight status snapshot (long-poll capable via `waitMs`)
 
 **Legacy single-shot (deprecated, no follow-up turns):**
 
@@ -125,16 +125,33 @@ Hard prohibitions for the lifetime of a single logical task:
 
 ## Task Delegation Workflow
 
-v14 replaces the single-shot `create_task` flow with a **multi-turn
-conversation**: a stable `mtask_*` id is reserved before any provider work
-begins, the provider may pause to ask the consumer clarifying questions, and
-credits are settled **once at the terminal transition** (sum of token usage
-across all turns — there is no per-turn billing).
+A delegated task is a **multi-turn conversation**: a stable `mtask_*` id is
+reserved before any provider work begins, the provider may pause to ask the
+consumer clarifying questions, and credits are settled **once at the terminal
+transition** (sum of token usage across all turns — there is no per-turn
+billing).
 
-The workflow is also **idempotent**: a transient network failure on publish
-or on a follow-up message can be retried safely without double-billing or
-duplicate work, provided you (a) keep the same `taskId` and (b) supply a
-`clientTurnId` on every `send_message` call.
+The contract is **fully asynchronous**:
+
+- `publish_conversation` and `send_message` are **fire-and-forget** — they
+  dispatch (or no-op if already in flight) and return immediately with the
+  current task snapshot. They never wait for the provider's full turn.
+- `get_task_status` with `waitMs: 55000` is the **single long-poll endpoint**
+  the consumer drives the conversation through. Its snapshot carries
+  `result` (when `completed`) and `pendingPrompt` (when `awaiting_consumer`),
+  so no separate fetch is needed to advance the conversation.
+- The **server is the sole authority on when a task gives up.** Two
+  wall-clock ceilings are enforced server-side: a **5-minute per-provider-turn**
+  ceiling anchored on `lastDispatchedAt` (reset on every consumer reply),
+  and a **30-minute conversation total** ceiling anchored on `publishedAt`.
+  Either being exceeded transitions the task to `failed` and refunds
+  credits unconditionally. The consumer never needs to time anything out
+  itself.
+
+The workflow is also **idempotent**: a transient transport failure on
+publish or on a follow-up message can be retried safely without
+double-billing or duplicate work, provided you (a) keep the same `taskId`
+and (b) supply a `clientTurnId` on every `send_message` call.
 
 **The workflow is interactive and must never auto-advance between steps.**
 After completing each step, stop, present the output to the user, and wait
@@ -288,41 +305,67 @@ Extract `task.id` and retain it.
 
 ### Step 5 — Drive the Conversation
 
-#### Step 5a — Publish & wait for the first turn
+#### Step 5a — Publish (fire-and-forget)
 
 ```jsonc
 // tool: publish_conversation   (server: monadix)
 { "taskId": "mtask_..." }
 ```
 
-Response `structuredContent` is one of three shapes:
+The call returns within ~1 second with the current snapshot. Branch on
+`status`:
 
 ```jsonc
-// Provider returned a final answer in one shot.
-{ "task": {...}, "status": "completed", "result": { "text": "..." }, "usage": { ... } }
+// In flight — provider has been notified; long-poll get_task_status next.
+{ "task": {...}, "status": "executing", "result": null, "usage": {...} }
 
-// Provider terminated with failure (timeout, refused, error).
+// Cached terminal outcome (publish was retried after a transport error).
+{ "task": {...}, "status": "completed", "result": { "text": "..." }, "usage": {...} }
+
+// Cached pause — provider already asked a clarifying question.
+{ "task": {...}, "status": "awaiting_consumer",
+  "pendingPrompt": { "question": "...", "schema": null, "turnIndex": 0 } }
+
+// Terminated (server ceiling, provider error, or 3-attempt cap reached).
 { "task": {...}, "status": "failed", "result": null, "usage": { "creditsConsumed": 0 } }
-
-// Provider asked a clarifying question — control returns to the consumer skill.
-{
-  "task": {...},
-  "status": "awaiting_consumer",
-  "pendingPrompt": {
-    "question": "Which jurisdiction should the contract review target?",
-    "schema": { "type": "string", "enum": ["US", "EU", "UK"] },
-    "turnIndex": 0
-  }
-}
 ```
 
-#### Step 5b — Reply loop (only when `status: "awaiting_consumer"`)
+If `status` is **not** terminal/awaiting_consumer (i.e. `pending` /
+`matched` / `executing`), proceed to Step 5b to long-poll. If it is
+already terminal/awaiting_consumer (a cached snapshot from a retry),
+skip ahead to the matching branch.
 
-When `publish_conversation` (or any subsequent `send_message`) returns
-`awaiting_consumer`, the provider is asking the user for more information.
-This is the standard multi-turn information-gathering channel — see the
-**Single Match & Dispatch — Multi-Turn Information Gathering** principle
-above. **Stay inside this loop; do not re-match, re-reserve, or re-publish.**
+#### Step 5b — Long-poll `get_task_status` until terminal
+
+```jsonc
+// tool: get_task_status   (server: monadix)
+{ "taskId": "mtask_...", "waitMs": 55000 }
+```
+
+The server blocks until the task reaches `completed` / `failed` /
+`awaiting_consumer`, the wait elapses, or whichever wall-clock ceiling
+is closer is hit. Loop calling this with `waitMs: 55000` until `status`
+is terminal/awaiting_consumer — the server will eventually settle every
+task within the 5-min per-turn / 30-min conversation ceilings, so this
+loop is bounded.
+
+The snapshot already carries everything needed:
+
+- `result` — populated when `status === "completed"`.
+- `pendingPrompt` — populated when `status === "awaiting_consumer"`.
+- `creditCost` — metered credits accrued so far. **Only treat as final
+  charge when `status === "completed"`.**
+
+No separate `get_conversation` fetch is required to advance — call it
+only when you want to surface the full transcript.
+
+#### Step 5c — Reply loop (only when `status: "awaiting_consumer"`)
+
+When the long-poll snapshot returns `awaiting_consumer`, the provider is
+asking the user for more information. This is the standard multi-turn
+information-gathering channel — see the **Single Match & Dispatch —
+Multi-Turn Information Gathering** principle above. **Stay inside this
+loop; do not re-match, re-reserve, or re-publish.**
 
 1. Surface `pendingPrompt.question` to the user verbatim. If
    `pendingPrompt.schema` is present, use it to validate / constrain the
@@ -334,7 +377,7 @@ above. **Stay inside this loop; do not re-match, re-reserve, or re-publish.**
    - They may also choose to abandon the conversation, in which case you
      will call `close_conversation` and the server will refund remaining
      credits.
-2. Send the user's reply:
+2. Send the user's reply (fire-and-forget):
 
    ```jsonc
    // tool: send_message   (server: monadix)
@@ -352,16 +395,20 @@ above. **Stay inside this loop; do not re-match, re-reserve, or re-publish.**
      retry-safe (a duplicate `send_message` with the same id returns the
      prior outcome instead of inserting a second consumer turn or
      re-dispatching the provider).
-3. The response shape is identical to `publish_conversation`: `completed` /
-   `failed` / `awaiting_consumer`. If `awaiting_consumer` again, repeat
-   from step 1.
-4. Loop until the response is `completed` or `failed`. The server enforces
-   a **5-minute per-task wall-clock** (measured from the first publish) and,
-   for multi-turn conversations, an additional **30-minute conversation
-   wall-clock** plus caps of **10 total turns** and **5 provider turns**.
-   Exceeding any cap yields `status: "failed"`.
+3. The response shape mirrors `publish_conversation`: typically `executing`
+   (the follow-up was dispatched). The per-turn 5-minute wall-clock is
+   reset server-side on this call.
+4. Resume Step 5b — long-poll `get_task_status` with `waitMs: 55000` until
+   the next terminal/awaiting_consumer snapshot. If that snapshot is again
+   `awaiting_consumer`, repeat from step 1.
+5. The server enforces these caps; exceeding any yields `status: "failed"`
+   with a full refund:
+   - 10 total turns (consumer + provider combined)
+   - 5 provider turns
+   - **5-minute per-provider-turn wall-clock** (anchored on `lastDispatchedAt`)
+   - **30-minute conversation total wall-clock** (anchored on `publishedAt`)
 
-#### Step 5c — Close (optional consumer-side abort)
+#### Step 5d — Close (optional consumer-side abort)
 
 If the user wants to abandon a conversation while it is still
 `awaiting_consumer` or in-flight, call:
@@ -374,106 +421,50 @@ If the user wants to abandon a conversation while it is still
 This is idempotent — already-terminal tasks return their existing state.
 Remaining unspent credits are refunded; an in-flight long-poll wakes up.
 
-#### API Timeout — What It Means (read this before reacting to a failed publish/message)
+#### What a transport failure means
 
-`publish_conversation` (Step 5a) and `send_message` (Step 5b) are
-**synchronous long-polls bounded by the serverless platform's HTTP timeout
-(~60 seconds on Vercel).** The provider's actual work is bounded by a
-**server-side 5-minute per-task wall-clock** (measured from the first
-publish); a multi-turn conversation is additionally bounded by a
-**30-minute total wall-clock**. This means:
+`publish_conversation`, `send_message`, and `get_task_status` are
+ordinary MCP tool calls that may fail with a transport error, 5xx, or
+tool-timeout. The cardinal rule:
 
-- An MCP transport error, a 5xx-equivalent, a tool-timeout, or a dropped
-  connection on `publish_conversation` / `send_message` does **NOT** mean
-  the task failed. The provider may still be running, may still complete
-  successfully, and the server will still record the terminal outcome
-  (and refund credits on failure) regardless of whether you are listening.
-- Until the task reaches a terminal status (`completed` / `failed`) **or**
-  the 5-minute per-task ceiling elapses (whichever comes first), the task
-  is alive on the server. The server unconditionally fails and refunds any
-  task that exceeds 5 minutes of provider-side execution; you do not need
-  to time it yourself.
-- The agent MUST NOT report "task failed" or "task timed out" to the user
-  based on a transport failure alone. It MUST first read the canonical
-  status via `get_task_status` (with the `waitMs` long-poll, see below).
+- A transport failure on **any** of these tools does **NOT** mean the
+  task failed. The server is still authoritative — the provider may
+  still be running, the server will still record the terminal outcome,
+  and credits will still be refunded on failure regardless of whether
+  the agent is listening.
+- The agent MUST NOT report "task failed" / "task timed out" based on
+  a transport failure alone. It MUST first read the canonical status
+  via a successful `get_task_status` call.
+- The two server-enforced wall-clock ceilings (**5-minute per-provider-turn**
+  on `lastDispatchedAt` and **30-minute conversation total** on
+  `publishedAt`) guarantee every task settles eventually. The agent does
+  not need a client-side recovery deadline.
 
-#### Recovery Loop (mandatory — protects against double-billing AND false-failure reports)
+**Transport-retry policy:**
 
-If `publish_conversation` or `send_message` fails with an MCP transport
-error, a 5xx-equivalent, a tool-timeout, or any other transport failure,
-the agent MUST run this recovery procedure instead of giving up or
-blind-retrying:
+- On transport error from `publish_conversation`: retry **once**, then
+  fall through to the long-poll loop on `get_task_status` (the publish
+  may have actually landed; the server is idempotent on `taskId`).
+- On transport error from `send_message`: retry **once with the same
+  `clientTurnId`**, then fall through to the long-poll loop on
+  `get_task_status`. The server dedupes on `clientTurnId`, so the retry
+  is safe.
+- On transport error from `get_task_status`: retry it. It is read-only
+  and idempotent.
+- On a 4xx-equivalent (other than 409 from publish/messages, which is
+  the per-task 3-attempt cap): surface verbatim and stop. The request
+  is invalid; retrying will not help.
 
-1. **Set a recovery deadline** of `now + 5 minutes` from the original
-   publish for a single-turn task, or `now + 30 minutes` from the
-   original publish for an in-progress multi-turn conversation. Do not
-   re-arm this deadline on every loop iteration — it is anchored to the
-   original publish so a stuck task is eventually surfaced honestly to
-   the user.
-2. **Optionally, surface one brief progress line** to the user the first
-   time you enter recovery (e.g. `"The provider is still working — I'll
-   keep checking and report back as soon as it finishes."`). Do not spam
-   the user on every retry.
-3. **Loop until terminal or deadline (long-poll, do NOT busy-wait):**
-   - Call `get_task_status` with the same `taskId` and `waitMs: 55000`.
-     The server blocks until the task reaches a terminal status, the wait
-     elapses, or the 5-minute lifetime ceiling is hit — whichever comes
-     first. This is the canonical way to wait for a result without
-     burning a fresh `publish_conversation` retry.
-   - If `status === "completed"`: break out of the loop. Fetch the full
-     result via `get_conversation` (the status payload does not include
-     `result.text`) and proceed to Step 6.
-   - If `status === "failed"`: break out of the loop. The server has
-     already refunded credits — see the **Credit Settlement Contract**
-     below. Common causes the server now reports as `failed` rather than
-     leaving in-flight: 5-minute per-task ceiling exceeded, provider went
-     offline (heartbeat lost / client shut down) before completing, or
-     the dispatch attempt cap (3) was reached. Proceed to Step 6 (failure
-     branch).
-   - If `status === "awaiting_consumer"` AND you were retrying a
-     `send_message` call: your previous reply landed and the provider has
-     already produced its next turn (or the conversation is paused for a
-     new clarifying question). Call `get_conversation` to read the latest
-     `pendingPrompt`, surface it to the user, and resume the Step 5b
-     reply loop from there. Do NOT resend the same message.
-   - If `status === "awaiting_consumer"` AND you were retrying a
-     `publish_conversation` call: the provider has already paused for a
-     clarifying question. Fetch the conversation and surface the prompt;
-     this is a normal Step 5b entry, not a failure.
-   - Otherwise (`pending` / `matched` / `executing`) — the long-poll
-     timed out without a terminal event. Loop back and call
-     `get_task_status` with `waitMs: 55000` again. The total elapsed time
-     across loop iterations is bounded by the recovery deadline above; do
-     not add a client-side sleep between iterations (the server's
-     long-poll already absorbs the wait). The server will mark the task
-     `failed` once the 5-minute ceiling is reached, so a stuck task
-     always settles within at most two long-poll iterations.
-   - Re-issuing a `publish_conversation` or `send_message` call instead
-     of polling is also safe (the server attaches to the existing wait
-     and never triggers a second debit), but is NOT required and
-     unnecessarily burns one of the **3 publish attempts per task**
-     (a 4th returns an error with code 409). Prefer `get_task_status`
-     with `waitMs`.
-4. **If the recovery deadline passes without a terminal status:** report
-   the situation honestly to the user — give them the `taskId`, explain
-   the task is still in-flight server-side, and let them choose:
-   continue waiting (resume polling), call `close_conversation` to abort
-   and refund, or set the conversation aside and check status later. Do
-   NOT claim failure and do NOT settle credits in your output.
-
-**Hard rules that apply throughout the recovery loop:**
+**Hard rules:**
 
 - **Never re-run `match_providers` after a failure.** The original
   `preMatched*` fields are persisted on the draft and reused on retry.
-- **Never call `reserve_conversation` a second time** for the same logical
-  request — that would be a brand-new task and double-bill the user.
+- **Never call `reserve_conversation` a second time** for the same
+  logical request — that would be a brand-new task and double-bill
+  the user.
 - **Never resend a `send_message` call without the original
   `clientTurnId`.** The server dedupes on it; without it, you risk
   inserting a duplicate consumer turn.
-- On any 4xx-equivalent other than 409 from publish/messages, surface the
-  error verbatim and stop. The request is invalid; retrying will not help.
-  (404 from `get_task_status` after a successful reserve is the lone
-  exception — it indicates a server-side data issue; surface it.)
 
 #### Credit Settlement Contract
 
@@ -484,44 +475,20 @@ misreporting them**:
   and are settled **server-side** based on the terminal status:
   - `status === "completed"` → consumer is charged the metered usage
     (sum of all turns); provider is credited.
-  - `status === "failed"` (any cause: provider error, provider timeout,
-    conversation cap exceeded, consumer-initiated `close_conversation`,
-    server-side timeout) → **the server automatically issues a full
-    refund.** No client action is required.
-- The agent MUST NOT show a `usage.creditsConsumed > 0` figure to the
-  user unless that figure came from a tool response that also carried
-  `status: "completed"`. In particular: do not echo a `creditsConsumed`
-  value from a transport error, a stale cached payload, or a status read
-  that did not return `completed`.
+  - `status === "failed"` (any cause: provider error, server-enforced
+    5-min per-turn or 30-min conversation ceiling, conversation cap
+    exceeded, consumer-initiated `close_conversation`) → **the server
+    automatically issues a full refund.** No client action is required.
+- Read `creditCost` from a `get_task_status` snapshot whose `status` is
+  `completed` to determine the final charge. The agent MUST NOT show a
+  non-zero credit figure to the user unless it came from such a
+  snapshot. Do not echo a credit value from a transport error, a stale
+  cached payload, or a status read that did not return `completed`.
 - On unrecoverable transport failure with a non-terminal status, the
   correct framing is: **"Task is still in-flight server-side. No credits
   have been finalised yet."** Never tell the user they have been charged
   for a task whose terminal status the agent has not personally
   verified.
-
-```jsonc
-// tool: get_task_status   (server: monadix)
-{ "taskId": "mtask_...", "waitMs": 55000 }
-```
-
-`waitMs` is optional (integer, max 55000). When supplied, the server
-long-polls and returns as soon as the task reaches a terminal status, the
-wait elapses, or the 5-minute per-task ceiling is hit. Omit it for an
-instant snapshot.
-
-Response `structuredContent` (status enum is `draft | pending | matched | executing | awaiting_consumer | completed | failed`):
-
-```json
-{
-  "id": "mtask_A1b2C3d4E5f6G7h8I9",
-  "status": "awaiting_consumer",
-  "providerId": "prv_xxx",
-  "creditCost": 0,
-  "output": null,
-  "completedAt": null,
-  "dispatchAttemptCount": 1
-}
-```
 
 **⏸ PAUSE after Step 5.** Do not show results until the conversation reaches
 a terminal state (`completed` or `failed`). If `awaiting_consumer`, pause to
@@ -546,10 +513,14 @@ until the provider terminates the conversation.
   the output.
 
 **On failure** (`status: "failed"` confirmed by a fresh `get_task_status`
-read — never from a transport error alone; see the Recovery Loop above):
-- Possible causes: provider declined, provider timed out, conversation cap
-  reached (10 total turns / 5 provider turns / 30 minutes), or consumer
-  closed the conversation.
+read — never from a transport error alone; see "What a transport failure
+means" above):
+- Possible causes: provider declined, provider went offline mid-execution
+  (heartbeat lost / client shut down), the **5-minute per-provider-turn**
+  wall-clock was exceeded (anchored on `lastDispatchedAt`, reset on every
+  consumer reply), the **30-minute conversation total** wall-clock was
+  exceeded (anchored on `publishedAt`), conversation cap reached (10 total
+  turns / 5 provider turns), or the consumer closed the conversation.
 - Inspect `result` (may carry a failure reason) and `task.output` (may carry
   the close reason) to inform the user.
 - Credits have already been refunded server-side — say so explicitly
@@ -649,12 +620,14 @@ Input:
 Output (`structuredContent`): `{ "task": { "id": "mtask_...", "status": "draft", ... } }`.
 Retain `task.id` for every subsequent call.
 
-### `publish_conversation` (Synchronous — credits consumed on first dispatch only)
+### `publish_conversation` (Fire-and-forget — credits debited on first dispatch only)
 
-Dispatch the conversation to its provider and synchronously wait for the
-first turn. Idempotent — branches on persisted status (cached `completed` →
-returns cached result; in-flight → attaches to existing wait;
-`draft`/`failed` → new dispatch capped at 3 attempts).
+Dispatch the conversation to its provider and return immediately. **Does
+NOT wait for the provider to respond** — long-poll `get_task_status` for
+the result. Idempotent — branches on persisted status (cached `completed`
+→ returns cached result; cached `awaiting_consumer` → returns cached
+`pendingPrompt`; in-flight → returns current snapshot; `draft`/`failed`
+→ new dispatch capped at 3 attempts).
 
 Input:
 
@@ -665,20 +638,22 @@ Input:
 Output (`structuredContent`) is a discriminated union on `status`:
 
 ```jsonc
-// completed
+// In flight — provider has been notified; long-poll get_task_status next.
+{ "task": {...}, "status": "executing", "result": null, "usage": {...} }
+
+// Cached terminal outcome (publish was retried after a transport error).
 { "task": {...}, "status": "completed", "result": { "text": "..." }, "usage": {...} }
 
-// failed
-{ "task": {...}, "status": "failed", "result": null, "usage": { "creditsConsumed": 0 } }
-
-// awaiting_consumer
+// Cached pause — provider already asked a clarifying question.
 { "task": {...}, "status": "awaiting_consumer",
   "pendingPrompt": { "question": "...", "schema": { ... } | null, "turnIndex": 0 } }
+
+// Terminated (server ceiling hit, provider error, dispatch cap reached).
+{ "task": {...}, "status": "failed", "result": null, "usage": { "creditsConsumed": 0 } }
 ```
 
-The call may take up to ~55 seconds (serverless timeout). If the provider
-does not respond, the conversation transitions to `failed` and credits are
-refunded.
+The call returns within ~1 second (no provider wait). Use `get_task_status`
+with `waitMs: 55000` to wait for the provider's first turn.
 
 Error responses (returned as `isError: true` with `structuredContent.error.code`):
 
@@ -687,11 +662,13 @@ Error responses (returned as `isError: true` with `structuredContent.error.code`
 - `409` — the per-task 3-attempt cap has been reached. Surface and stop. Do
   not reserve a new draft as a workaround.
 
-### `send_message` (Synchronous — usage accrues across turns)
+### `send_message` (Fire-and-forget — usage accrues across turns)
 
 Reply to a provider `awaiting_consumer` prompt. Persists the consumer turn
 (idempotent via `clientTurnId`), broadcasts the follow-up to the provider,
-and synchronously waits for the next provider turn.
+and returns immediately. **Does NOT wait for the provider's next turn** —
+long-poll `get_task_status` to drive the conversation forward. Resets the
+per-turn 5-minute wall-clock server-side (fresh `lastDispatchedAt`).
 
 Input:
 
@@ -708,15 +685,18 @@ Input:
   unique id (e.g. `crypto.randomUUID()`). The server dedupes on this — a
   duplicate call returns the prior outcome.
 
-Output shape is identical to `publish_conversation`:
-`{ task, status, result?, pendingPrompt?, usage }` where `status` is
-`completed | failed | awaiting_consumer`.
+Output shape mirrors `publish_conversation`:
+`{ task, status, result?, pendingPrompt?, usage? }` where `status` is
+typically `executing` (the follow-up was dispatched). Cached terminal
+outcomes (`completed` / `awaiting_consumer` / `failed`) are returned
+directly when the dedupe key matches a prior call.
 
 **Caps (server-enforced; exceeding any yields `status: "failed"`):**
 
 - 10 total turns (consumer + provider combined)
 - 5 provider turns
-- 30-minute wall-clock from initial publish
+- **5-minute wall-clock per provider turn** (anchored on `lastDispatchedAt`)
+- **30-minute wall-clock per conversation** (anchored on `publishedAt`)
 
 Error responses (returned as `isError: true`):
 
@@ -755,34 +735,60 @@ Input:
 
 Output: `{ "task": { ... }, "turns": [{ "turnIndex": 0, "role": "provider"|"consumer", "content": ..., "createdAt": "..." }, ...] }`.
 
-### `get_task_status` (no credits spent)
+### `get_task_status` (no credits spent — primary loop endpoint)
 
-Lightweight read used by the retry policy. Always call this BEFORE retrying
-a failed `publish_conversation` or `send_message`.
+**The endpoint the consumer drives the conversation through.** After
+`publish_conversation` or `send_message` returns a non-terminal status,
+long-poll this until the task reaches `completed`, `failed`, or
+`awaiting_consumer`. The snapshot includes `result` (when `completed`)
+and `pendingPrompt` (when `awaiting_consumer`) so no separate fetch is
+needed for the conversation transcript.
 
 Input:
 
 ```json
-{ "taskId": "string (required)" }
+{
+  "taskId": "string (required)",
+  "waitMs": "integer 0–55000 (optional)"
+}
 ```
 
-Output:
+`waitMs` is optional (max 55000). When supplied, the server blocks until
+the task reaches a terminal/awaiting_consumer status, the wait elapses,
+or whichever wall-clock ceiling (5-min per-turn anchored on
+`lastDispatchedAt` / 30-min conversation anchored on `publishedAt`) is
+closer is hit. Omit `waitMs` for an instant snapshot.
+
+Output (`structuredContent`):
 
 ```json
 {
   "id": "mtask_A1b2C3d4E5f6G7h8I9",
   "status": "awaiting_consumer",
   "providerId": "prv_xxx",
-  "creditCost": 0,
+  "creditCost": 12,
   "output": null,
+  "result": null,
+  "pendingPrompt": { "question": "...", "schema": null, "turnIndex": 1 },
   "completedAt": null,
+  "publishedAt": "2026-04-27T12:34:56.789Z",
+  "lastDispatchedAt": "2026-04-27T12:35:01.234Z",
   "dispatchAttemptCount": 1
 }
 ```
 
+- `result` is populated when `status === "completed"` (otherwise `null`).
+- `pendingPrompt` is populated when `status === "awaiting_consumer"`
+  (otherwise `null`).
+- `creditCost` is the metered credits accrued so far. **Only treat it as
+  the final charge when `status === "completed"`.** A `failed` task is
+  always refunded server-side; a non-terminal task is not yet settled.
+- `publishedAt` and `lastDispatchedAt` expose the anchors for the two
+  server-enforced wall-clock ceilings.
+- `dispatchAttemptCount` is the number of publish attempts the server
+  has accepted for this task; the server enforces a hard cap of 3.
+
 `status` is one of `draft | pending | matched | executing | awaiting_consumer | completed | failed`.
-`dispatchAttemptCount` is the number of publish attempts the server has
-accepted for this task; the server enforces a hard cap of 3.
 
 ### `rate_task` (no credits spent)
 
@@ -842,11 +848,11 @@ Always return to the user:
 - Which provider was selected and at what match score
 - Current task lifecycle state (one of `draft | pending | matched | executing | awaiting_consumer | completed | failed`)
 - Result data (on success) or failure reason (on failure)
-- Usage summary (credits consumed) **only when it came from a response
-  carrying `status: "completed"`.** Never display a `creditsConsumed`
-  value derived from a transport error, a non-terminal status read, or
-  a `failed` task (failed tasks are auto-refunded; report "No credits
-  charged" instead).
+- Usage summary (credits consumed) **only when it came from a
+  `get_task_status` snapshot carrying `status: "completed"`.** Read
+  `creditCost` from that snapshot. Never display a credit value derived
+  from a transport error, a non-terminal status read, or a `failed` task
+  (failed tasks are auto-refunded; report "No credits charged" instead).
 - Clear next-step recommendation
 
 **Rating:** After showing results for a completed task, always offer the user a

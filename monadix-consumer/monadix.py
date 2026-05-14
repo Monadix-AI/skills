@@ -102,109 +102,111 @@ def rate_task(task_id: str, rating: int) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Conversation primitives (v14)
+# Conversation primitives
 # ---------------------------------------------------------------------------
 
 import uuid
 
-MAX_PUBLISH_ATTEMPTS = 3
+# Server-side per-call long-poll cap for `GET /network/tasks/<id>/status?wait=`.
+# The server enforces a hard ceiling of 55_000 ms regardless.
+STATUS_LONG_POLL_MS = 55_000
+
+# Statuses at which the consumer must stop polling and either surface the
+# result to the user or solicit a reply. Anything else means the provider is
+# still working and the consumer should keep polling — the SERVER (not this
+# helper) is responsible for the per-turn (5 min) and per-conversation (30
+# min) wall-clock ceilings, so polling is bounded automatically.
+TERMINAL_STATUSES = {"completed", "failed", "awaiting_consumer"}
 
 
 def _gen_client_turn_id() -> str:
     return str(uuid.uuid4())
 
 
-def _run_with_retry(task_id: str, attempt_fn, label: str, can_retry_on_status) -> dict | None:
-    """
-    Generic capped retry runner with mandatory status-check-before-retry.
+def _post_with_transport_retry(path: str, body: dict | None, *, label: str) -> dict | None:
+    """POST and retry once on a transport/5xx error.
 
-    can_retry_on_status(snap) returns one of:
-      'retry'    — issue attempt_fn again
-      'attached' — server moved on; re-issue attempt_fn once more (idempotent)
-      'abort'    — stop and return None
+    The publish and messages endpoints are idempotent server-side (publish
+    branches on persisted task status; messages dedupes on `clientTurnId`),
+    so a fresh retry never double-bills or duplicates a turn. 4xx responses
+    other than 409 are surfaced as terminal failures; 409 means the server
+    cap was reached and is also terminal.
     """
-    last_error: Exception | None = None
-    for attempt in range(1, MAX_PUBLISH_ATTEMPTS + 1):
+    for attempt in (1, 2):
         try:
-            return attempt_fn()
+            return call_monadix(path, body)
         except MonadixAPIError as err:
-            last_error = err
-            if 400 <= err.status < 500 and err.status != 409:
-                print(f"{label} failed with {err.status} — not retryable. {err}")
-                return None
             if err.status == 409:
                 print(f"{label} rejected by server cap (409). Aborting. {err}")
                 return None
-            if attempt == MAX_PUBLISH_ATTEMPTS:
+            if 400 <= err.status < 500:
+                print(f"{label} failed with {err.status} — not retryable. {err}")
+                return None
+            if attempt == 2:
                 print(f"{label} failed after {attempt} attempts: {err}")
                 return None
-            print(f"{label} attempt {attempt} failed ({err.status}). Checking task status before retry...")
+            print(f"{label} attempt {attempt} failed ({err.status}) — retrying once.")
         except urllib.error.URLError as err:
-            last_error = err
-            if attempt == MAX_PUBLISH_ATTEMPTS:
+            if attempt == 2:
                 print(f"{label} failed after {attempt} attempts: {err}")
                 return None
-            print(f"{label} attempt {attempt} failed (network). Checking task status before retry...")
-
-        try:
-            snap = get_monadix(f"/network/tasks/{task_id}/status")
-            verdict = can_retry_on_status(snap)
-            if verdict == "abort":
-                print(f"Task is {snap.get('status')} — not eligible for {label} retry. Aborting.")
-                return None
-            if verdict == "attached":
-                print(f"Task is {snap.get('status')} server-side — re-issuing {label} to attach/fetch cached.")
-            else:
-                print(f"Task is {snap.get('status')} (attempt {snap.get('dispatchAttemptCount', attempt)}/{MAX_PUBLISH_ATTEMPTS}) — retrying.")
-        except (MonadixAPIError, urllib.error.URLError) as status_err:
-            print(f"Status check failed: {status_err} — retrying anyway.")
-
+            print(f"{label} attempt {attempt} failed (network) — retrying once.")
     return None
 
 
-def publish_conversation(task_id: str) -> dict | None:
-    """
-    Publish a previously-reserved conversation draft. Idempotent.
-    Returns the publish outcome ({task, status, result?, pendingPrompt?, usage?})
-    or None on terminal failure.
-    """
-    def _verdict(snap: dict) -> str:
-        s = snap.get("status")
-        if s in ("completed", "failed", "awaiting_consumer", "pending", "matched", "executing"):
-            return "attached"
-        return "retry"  # draft / failed (re-eligible)
+def wait_until_terminal(task_id: str) -> dict | None:
+    """Long-poll `GET /network/tasks/<id>/status?wait=55000` until the task
+    reaches `completed`, `failed`, or `awaiting_consumer`.
 
-    return _run_with_retry(
-        task_id,
-        lambda: call_monadix(f"/network/conversations/{task_id}/publish"),
-        "Publish",
-        _verdict,
+    The server enforces both the per-turn (5 min) and per-conversation
+    (30 min) wall-clock ceilings; either being exceeded transitions the
+    task to `failed` and refunds credits unconditionally. The consumer
+    therefore NEVER needs to time out itself — every long-poll iteration
+    is bounded by the server, and looping indefinitely is safe.
+
+    Returns the final status snapshot, or None on a terminal API error.
+    """
+    while True:
+        try:
+            snap = get_monadix(
+                f"/network/tasks/{task_id}/status?wait={STATUS_LONG_POLL_MS}"
+            )
+        except MonadixAPIError as err:
+            print(f"Status read failed with {err.status}: {err}")
+            return None
+        except urllib.error.URLError as err:
+            print(f"Status read network error: {err} — retrying.")
+            continue
+        if snap.get("status") in TERMINAL_STATUSES:
+            return snap
+        # pending / matched / executing — provider is still working; loop again.
+
+
+def publish_conversation(task_id: str) -> dict | None:
+    """Publish a previously-reserved conversation draft. Fire-and-forget.
+
+    Returns the dispatch acknowledgment (`{task, status, ...}`) or None on
+    terminal failure. The returned `status` may be `pending` / `matched` /
+    `executing` (in flight — call `wait_until_terminal`), `awaiting_consumer`
+    / `completed` (terminal — payload already includes `pendingPrompt` /
+    `result`), or `failed` (terminal failure).
+    """
+    return _post_with_transport_retry(
+        f"/network/conversations/{task_id}/publish", None, label="Publish"
     )
 
 
 def respond_to_provider(task_id: str, content, client_turn_id: str | None = None) -> dict | None:
-    """
-    Send a single consumer follow-up message. Idempotent via clientTurnId —
-    always retry-safe with the same id.
+    """Send a single consumer follow-up message. Fire-and-forget.
+
+    Always sends a `clientTurnId` (auto-generated when omitted) so a
+    transport retry is dedupe-safe server-side.
     """
     turn_id = client_turn_id or _gen_client_turn_id()
-
-    def _verdict(snap: dict) -> str:
-        s = snap.get("status")
-        if s in ("completed", "failed", "executing", "matched"):
-            return "attached"
-        if s == "awaiting_consumer":
-            return "retry"
-        return "abort"
-
-    return _run_with_retry(
-        task_id,
-        lambda: call_monadix(
-            f"/network/conversations/{task_id}/messages",
-            {"content": content, "clientTurnId": turn_id},
-        ),
-        "Message",
-        _verdict,
+    return _post_with_transport_retry(
+        f"/network/conversations/{task_id}/messages",
+        {"content": content, "clientTurnId": turn_id},
+        label="Message",
     )
 
 
@@ -279,13 +281,20 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
     task_id = draft["task"]["id"]
     print(f"Conversation reserved: {task_id}. Publishing...")
 
-    # Step 3b — Publish & wait for the first turn.
-    outcome = publish_conversation(task_id)
+    # Step 3b — Publish (fire-and-forget) then long-poll for the first
+    # terminal/awaiting_consumer status.
+    ack = publish_conversation(task_id)
+    if ack is None:
+        print("\nDelegation failed (publish rejected).")
+        return
+    snap = ack if ack.get("status") in TERMINAL_STATUSES else wait_until_terminal(task_id)
+    if snap is None:
+        print("\nDelegation failed (status read error).")
+        return
 
-    # Step 3c — Reply loop. Continues until terminal (completed/failed) or
-    # until publish/message returns None (terminal failure inside the helper).
-    while outcome is not None and outcome.get("status") == "awaiting_consumer":
-        pending = outcome.get("pendingPrompt", {}) or {}
+    # Step 3c — Reply loop. Continues until the conversation is terminal.
+    while snap.get("status") == "awaiting_consumer":
+        pending = snap.get("pendingPrompt", {}) or {}
         print("\n[Provider needs input]")
         print(f"Question: {pending.get('question', '(no question text)')}")
         if pending.get("schema"):
@@ -295,21 +304,23 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
             print("Aborting conversation...")
             close_conversation(task_id, "User aborted from helper.")
             return
-        outcome = respond_to_provider(task_id, user_reply, _gen_client_turn_id())
-
-    if outcome is None:
-        print("\nDelegation failed (see logs above).")
-        return
+        ack = respond_to_provider(task_id, user_reply, _gen_client_turn_id())
+        if ack is None:
+            print("\nDelegation failed (message rejected).")
+            return
+        snap = ack if ack.get("status") in TERMINAL_STATUSES else wait_until_terminal(task_id)
+        if snap is None:
+            print("\nDelegation failed (status read error).")
+            return
 
     # Step 4 — Show Results
-    task = outcome["task"]
-    if outcome.get("status") == "completed":
+    if snap.get("status") == "completed":
         print("\n[Step 4 — Results]")
         print("\nTask completed!")
-        print("Output:", json.dumps(outcome.get("result"), indent=2))
-        usage = outcome.get("usage")
-        if usage:
-            print(f"Credits consumed: {usage.get('creditsConsumed')}")
+        print("Output:", json.dumps(snap.get("result"), indent=2))
+        credit_cost = snap.get("creditCost")
+        if credit_cost is not None:
+            print(f"Credits consumed: {credit_cost}")
 
         # Step 5 — Rate (completed only)
         provider_name = chosen["provider"]["name"]
@@ -322,12 +333,15 @@ def delegate_task(description: str, input_data: dict | None = None) -> None:
         except ValueError:
             rating = 0
         if 1 <= rating <= 5:
-            err = rate_task(task["id"], rating)
+            err = rate_task(task_id, rating)
             print(f"Rating not recorded: {err}" if err else f"Rated {rating}\u2605")
         else:
             print("Rating skipped.")
     else:
-        print(f"\nTask {outcome.get('status')}. Delegation did not succeed.")
+        # `failed` — server has already refunded any debited credits.
+        output = snap.get("output") or {}
+        reason = output.get("error") or output.get("reason") or "no reason given"
+        print(f"\nTask failed: {reason}. No credits charged.")
 
 
 if __name__ == "__main__":

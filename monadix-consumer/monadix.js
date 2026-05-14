@@ -124,10 +124,19 @@ async function rateTask(taskId, rating) {
 // (delegateTask is defined below, after the conversation primitives.)
 
 // ---------------------------------------------------------------------------
-// Conversation primitives (v14)
+// Conversation primitives
 // ---------------------------------------------------------------------------
 
-var MAX_PUBLISH_ATTEMPTS = 3;
+// Server-side per-call long-poll cap for `GET /network/tasks/<id>/status?wait=`.
+// The server enforces a hard ceiling of 55_000 ms regardless.
+var STATUS_LONG_POLL_MS = 55000;
+
+// Statuses at which the consumer must stop polling and either surface the
+// result to the user or solicit a reply. Anything else means the provider is
+// still working and the consumer should keep polling — the SERVER (not this
+// helper) is responsible for the per-turn (5 min) and per-conversation (30
+// min) wall-clock ceilings, so polling is bounded automatically.
+var TERMINAL_STATUSES = { completed: true, failed: true, awaiting_consumer: true };
 
 function genClientTurnId() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -135,84 +144,100 @@ function genClientTurnId() {
 }
 
 /**
- * Generic capped retry runner with mandatory status-check-before-retry.
+ * POST and retry once on a transport / 5xx error.
  *
- * @param {string} taskId
- * @param {() => Promise<object>} attemptFn  - performs ONE call (publish or message)
- * @param {string} label                     - human label for log lines
- * @param {(snap: object) => 'retry'|'attached'|'abort'} canRetryOnStatus
- *        Decide what to do based on the persisted status snapshot:
- *          'retry'    — issue attemptFn again
- *          'attached' — server already moved on; do attemptFn once more to
- *                       re-attach to the existing wait or fetch cached result
- *          'abort'    — surface failure and stop
- * @returns {Promise<object|null>} the outcome from attemptFn, or null on failure
+ * The publish and messages endpoints are idempotent server-side (publish
+ * branches on persisted task status; messages dedupes on `clientTurnId`),
+ * so a fresh retry never double-bills or duplicates a turn. 4xx responses
+ * other than 409 are surfaced as terminal failures; 409 means the server
+ * cap was reached and is also terminal.
+ *
+ * @param {string} apiPath
+ * @param {object|undefined} body
+ * @param {string} label
+ * @returns {Promise<object|null>}
  */
-async function runWithRetry(taskId, attemptFn, label, canRetryOnStatus) {
-  var lastError = null;
-  for (var attempt = 1; attempt <= MAX_PUBLISH_ATTEMPTS; attempt++) {
+async function postWithTransportRetry(apiPath, body, label) {
+  for (var attempt = 1; attempt <= 2; attempt++) {
     try {
-      return await attemptFn();
+      return await callMonadix(apiPath, body);
     } catch (err) {
-      lastError = err;
       var status = err && err.status;
-      if (status >= 400 && status < 500 && status !== 409) {
-        console.log(label + ' failed with ' + status + ' — not retryable. ' + err.message);
-        return null;
-      }
       if (status === 409) {
         console.log(label + ' rejected by server cap (409). Aborting. ' + err.message);
         return null;
       }
-      if (attempt === MAX_PUBLISH_ATTEMPTS) {
+      if (status >= 400 && status < 500) {
+        console.log(label + ' failed with ' + status + ' — not retryable. ' + err.message);
+        return null;
+      }
+      if (attempt === 2) {
         console.log(label + ' failed after ' + attempt + ' attempts: ' + err.message);
         return null;
       }
-      console.log(label + ' attempt ' + attempt + ' failed (' + (status || 'network') + '). Checking task status before retry...');
-      try {
-        var snap = await getMonadix('/network/tasks/' + encodeURIComponent(taskId) + '/status');
-        var verdict = canRetryOnStatus(snap);
-        if (verdict === 'abort') {
-          console.log('Task is ' + snap.status + ' — not eligible for ' + label + ' retry. Aborting.');
-          return null;
-        }
-        if (verdict === 'attached') {
-          console.log('Task is ' + snap.status + ' server-side — re-issuing ' + label + ' to attach/fetch cached.');
-        } else {
-          console.log('Task is ' + snap.status + ' (attempt ' + (snap.dispatchAttemptCount || attempt) + '/' + MAX_PUBLISH_ATTEMPTS + ') — retrying.');
-        }
-      } catch (statusErr) {
-        console.log('Status check failed: ' + statusErr.message + ' — retrying anyway.');
-      }
+      console.log(label + ' attempt ' + attempt + ' failed (' + (status || 'network') + ') — retrying once.');
     }
   }
-  return lastError ? null : null;
+  return null;
 }
 
 /**
- * Publish a previously-reserved conversation draft. Idempotent.
- * Returns the publish outcome (`{task, status, result?, pendingPrompt?, usage?}`)
- * or null on terminal failure.
+ * Long-poll `GET /network/tasks/<id>/status?wait=55000` until the task
+ * reaches `completed`, `failed`, or `awaiting_consumer`.
+ *
+ * The server enforces both the per-turn (5 min) and per-conversation
+ * (30 min) wall-clock ceilings; either being exceeded transitions the task
+ * to `failed` and refunds credits unconditionally. The consumer therefore
+ * NEVER needs to time out itself — every long-poll iteration is bounded by
+ * the server, and looping indefinitely is safe.
+ *
+ * @param {string} taskId
+ * @returns {Promise<object|null>} the final snapshot, or null on terminal API error.
+ */
+async function waitUntilTerminal(taskId) {
+  while (true) {
+    var snap;
+    try {
+      snap = await getMonadix(
+        '/network/tasks/' + encodeURIComponent(taskId) + '/status?wait=' + STATUS_LONG_POLL_MS
+      );
+    } catch (err) {
+      if (err && typeof err.status === 'number') {
+        console.log('Status read failed with ' + err.status + ': ' + err.message);
+        return null;
+      }
+      console.log('Status read network error: ' + (err && err.message ? err.message : err) + ' — retrying.');
+      continue;
+    }
+    if (TERMINAL_STATUSES[snap.status]) return snap;
+    // pending / matched / executing — provider is still working; loop again.
+  }
+}
+
+/**
+ * Publish a previously-reserved conversation draft. Fire-and-forget.
+ *
+ * Returns the dispatch acknowledgment (`{task, status, ...}`) or null on
+ * terminal failure. The returned `status` may be `pending` / `matched` /
+ * `executing` (in flight — call `waitUntilTerminal`), `awaiting_consumer`
+ * / `completed` (terminal — payload already includes `pendingPrompt` /
+ * `result`), or `failed` (terminal failure).
  *
  * @param {string} taskId
  */
 async function publishConversation(taskId) {
-  return runWithRetry(
-    taskId,
-    function () { return callMonadix('/network/conversations/' + encodeURIComponent(taskId) + '/publish'); },
-    'Publish',
-    function (snap) {
-      if (snap.status === 'completed' || snap.status === 'failed') return 'attached';
-      if (snap.status === 'awaiting_consumer') return 'attached';
-      if (snap.status === 'pending' || snap.status === 'matched' || snap.status === 'executing') return 'attached';
-      return 'retry'; // draft / failed (re-eligible)
-    }
+  return postWithTransportRetry(
+    '/network/conversations/' + encodeURIComponent(taskId) + '/publish',
+    undefined,
+    'Publish'
   );
 }
 
 /**
- * Send a single consumer follow-up message. Idempotent via clientTurnId —
- * always retry-safe with the same id.
+ * Send a single consumer follow-up message. Fire-and-forget.
+ *
+ * Always sends a `clientTurnId` (auto-generated when omitted) so a
+ * transport retry is dedupe-safe server-side.
  *
  * @param {string} taskId
  * @param {string|object} content
@@ -220,24 +245,10 @@ async function publishConversation(taskId) {
  */
 async function respondToProvider(taskId, content, clientTurnId) {
   var turnId = clientTurnId || genClientTurnId();
-  return runWithRetry(
-    taskId,
-    function () {
-      return callMonadix(
-        '/network/conversations/' + encodeURIComponent(taskId) + '/messages',
-        { content: content, clientTurnId: turnId }
-      );
-    },
-    'Message',
-    function (snap) {
-      // Same clientTurnId is always safe to resend; server will dedupe.
-      if (snap.status === 'completed' || snap.status === 'failed') return 'attached';
-      // executing means our message landed and the provider is working — re-POST returns the dedup'd outcome.
-      if (snap.status === 'executing' || snap.status === 'matched') return 'attached';
-      // awaiting_consumer means message hasn't landed yet OR provider asked again — safe to retry.
-      if (snap.status === 'awaiting_consumer') return 'retry';
-      return 'abort';
-    }
+  return postWithTransportRetry(
+    '/network/conversations/' + encodeURIComponent(taskId) + '/messages',
+    { content: content, clientTurnId: turnId },
+    'Message'
   );
 }
 
@@ -325,13 +336,24 @@ async function delegateTask(description, inputData) {
   var taskId = draft.task.id;
   console.log('Conversation reserved: ' + taskId + '. Publishing...');
 
-  // Step 3b — Publish & wait for the first turn.
-  var outcome = await publishConversation(taskId);
+  // Step 3b — Publish (fire-and-forget) then long-poll for the first
+  // terminal/awaiting_consumer status.
+  var ack = await publishConversation(taskId);
+  if (!ack) {
+    rl.close();
+    console.log('\nDelegation failed (publish rejected).');
+    return;
+  }
+  var snap = TERMINAL_STATUSES[ack.status] ? ack : await waitUntilTerminal(taskId);
+  if (!snap) {
+    rl.close();
+    console.log('\nDelegation failed (status read error).');
+    return;
+  }
 
-  // Step 3c — Reply loop. Continues until terminal (completed/failed) or
-  // until publish/message returns null (terminal failure inside the helper).
-  while (outcome && outcome.status === 'awaiting_consumer') {
-    var prompt_ = outcome.pendingPrompt || {};
+  // Step 3c — Reply loop. Continues until the conversation is terminal.
+  while (snap.status === 'awaiting_consumer') {
+    var prompt_ = snap.pendingPrompt || {};
     console.log('\n[Provider needs input]');
     console.log('Question: ' + (prompt_.question || '(no question text)'));
     if (prompt_.schema) {
@@ -344,23 +366,28 @@ async function delegateTask(description, inputData) {
       rl.close();
       return;
     }
-    outcome = await respondToProvider(taskId, userReply.trim(), genClientTurnId());
+    ack = await respondToProvider(taskId, userReply.trim(), genClientTurnId());
+    if (!ack) {
+      rl.close();
+      console.log('\nDelegation failed (message rejected).');
+      return;
+    }
+    snap = TERMINAL_STATUSES[ack.status] ? ack : await waitUntilTerminal(taskId);
+    if (!snap) {
+      rl.close();
+      console.log('\nDelegation failed (status read error).');
+      return;
+    }
   }
   rl.close();
 
-  if (!outcome) {
-    console.log('\nDelegation failed (see logs above).');
-    return;
-  }
-
   // Step 4 — Show Results
-  var task = outcome.task;
-  if (outcome.status === 'completed') {
+  if (snap.status === 'completed') {
     console.log('\n[Step 4 — Results]');
     console.log('\nTask completed!');
-    console.log('Output:', JSON.stringify(outcome.result, null, 2));
-    if (outcome.usage) {
-      console.log('Credits consumed: ' + outcome.usage.creditsConsumed);
+    console.log('Output:', JSON.stringify(snap.result, null, 2));
+    if (snap.creditCost != null) {
+      console.log('Credits consumed: ' + snap.creditCost);
     }
 
     // Step 5 — Rate (completed only)
@@ -373,13 +400,16 @@ async function delegateTask(description, inputData) {
     rl2.close();
     var rating = parseInt(String(ratingAnswer).trim(), 10);
     if (rating >= 1 && rating <= 5) {
-      var err = await rateTask(task.id, rating);
+      var err = await rateTask(taskId, rating);
       console.log(err ? 'Rating not recorded: ' + err : 'Rated ' + rating + '★');
     } else {
       console.log('Rating skipped.');
     }
   } else {
-    console.log('\nTask ' + outcome.status + '. Delegation did not succeed.');
+    // `failed` — server has already refunded any debited credits.
+    var output = snap.output || {};
+    var reason = output.error || output.reason || 'no reason given';
+    console.log('\nTask failed: ' + reason + '. No credits charged.');
   }
 }
 
