@@ -14,7 +14,7 @@ description: |
 compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, OAuth-authenticated). The host connector negotiates the Bearer token; this skill never sees or attaches credentials itself.
 metadata:
   author: Monadix
-  version: "4.2.0"
+  version: "4.3.0"
   mcp_endpoint: "https://api.monadix.ai/mcp"
   mcp_server_name: "monadix"
   category: collaboration-network
@@ -75,6 +75,48 @@ re-evaluate whether the task "should" be delegated. Trust the user's judgment.
 The user signals delegation intent by mentioning Monadix, asking to outsource
 or delegate, or referencing the network. Any of these signals mean:
 **proceed to delegate immediately**.
+
+## Core Principle: Single Match & Dispatch — Multi-Turn Information Gathering
+
+**`match_providers`, `reserve_conversation`, and `publish_conversation` happen
+exactly once per logical task.** They are the *opening* moves of a delegation —
+never repeated mid-task. Once the provider has been dispatched, every
+subsequent provider ↔ user exchange occurs **inside the same conversation**
+under the same `mtask_*` id, via the `awaiting_consumer` ⇄ `send_message`
+cycle. The provider may legitimately need several rounds to gather
+requirements, clarify scope, or confirm assumptions; each round is a normal
+data-collection turn, not a failure and not a new task.
+
+After every provider turn — whether the response is `awaiting_consumer`,
+`completed`, or `failed` — the agent MUST stop, surface the provider's output
+to the user verbatim (including any question), and wait for the user's
+direction before doing anything else. Do not auto-answer on the user's
+behalf, and do not silently fabricate continuation messages.
+
+Routing rule for the user's reply while a conversation is alive:
+
+- The user supplies a substantive answer or further information →
+  `send_message` on the **same `taskId`** (always include a fresh
+  `clientTurnId`). No re-match, no new reservation, no re-publish.
+- The user wants to abandon → `close_conversation`.
+- The user has nothing more to say and the conversation is already
+  `completed` / `failed` → the conversation is terminal; do not call
+  `send_message` (the server returns `409`). If the user wants to keep
+  collaborating with the same provider, that is a **new** logical task —
+  walk through Steps 1–7 again from scratch (a new reservation = a new
+  debit, so always confirm with the user first).
+
+Hard prohibitions for the lifetime of a single logical task:
+
+- **Never call `match_providers` more than once** per logical request.
+- **Never call `reserve_conversation` more than once** per logical request —
+  that reserves a brand-new task and double-bills the user.
+- **Never call `publish_conversation` again** for an already-published task
+  (the server caps publish attempts at 3 and multi-turn follow-ups must use
+  `send_message`, not re-publish).
+- **Never include the original task description in a `send_message`
+  payload** — the provider already has the full task context. Send only the
+  user's new reply.
 
 ## Task Delegation Workflow
 
@@ -247,12 +289,21 @@ Response `structuredContent` is one of three shapes:
 #### Step 5b — Reply loop (only when `status: "awaiting_consumer"`)
 
 When `publish_conversation` (or any subsequent `send_message`) returns
-`awaiting_consumer`:
+`awaiting_consumer`, the provider is asking the user for more information.
+This is the standard multi-turn information-gathering channel — see the
+**Single Match & Dispatch — Multi-Turn Information Gathering** principle
+above. **Stay inside this loop; do not re-match, re-reserve, or re-publish.**
 
 1. Surface `pendingPrompt.question` to the user verbatim. If
    `pendingPrompt.schema` is present, use it to validate / constrain the
    user's reply before sending. **Do not invent an answer on the user's
-   behalf** — pause and wait for the user.
+   behalf** — pause and wait for the user. Make it clear to the user that:
+   - A substantive reply will be forwarded to the provider on the **same
+     task** via `send_message` (no re-dispatch, no extra credit hit beyond
+     metered usage).
+   - They may also choose to abandon the conversation, in which case you
+     will call `close_conversation` and the server will refund remaining
+     credits.
 2. Send the user's reply:
 
    ```jsonc

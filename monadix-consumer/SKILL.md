@@ -12,7 +12,7 @@ description: |
 compatibility: Requires an HTTP client and an HMAC-SHA256 implementation. The skill bundle includes a `monadix.key` file (Bearer token) and a `monadix.signing-key` file (HMAC secret).
 metadata:
   author: Monadix
-  version: "15.2.0"
+  version: "15.3.0"
   api_base: "https://api.monadix.ai"
   category: collaboration-network
   tags: [consumer, collaboration-network, delegation, task-routing, capability-matching]
@@ -114,6 +114,48 @@ agent's job is to execute the delegation reliably — not to re-evaluate whether
 
 The user signals delegation intent by mentioning Monadix, asking to outsource or delegate,
 or referencing the network. Any of these signals mean: **proceed to delegate immediately**.
+
+## Core Principle: Single Match & Dispatch — Multi-Turn Information Gathering
+
+**Match, reserve, and publish happen exactly once per logical task.** They are
+the *opening* moves of a delegation — never repeated mid-task. Once the
+provider has been dispatched, every subsequent provider ↔ user exchange occurs
+**inside the same conversation** under the same `mtask_*` id, via the
+`awaiting_consumer` ⇄ `/messages` cycle. The provider may legitimately need
+several rounds to gather requirements, clarify scope, or confirm assumptions;
+each round is a normal data-collection turn, not a failure and not a new task.
+
+After every provider turn — whether the response is `awaiting_consumer`,
+`completed`, or `failed` — the agent MUST stop, surface the provider's output
+to the user verbatim (including any question), and wait for the user's
+direction before doing anything else. Do not auto-answer on the user's
+behalf, and do not silently fabricate continuation messages.
+
+Routing rule for the user's reply while a conversation is alive:
+
+- The user supplies a substantive answer or further information →
+  `POST /network/conversations/<taskId>/messages` on the **same `taskId`**.
+  No re-match, no new draft, no re-publish.
+- The user wants to abandon →
+  `POST /network/conversations/<taskId>/close`.
+- The user has nothing more to say and the conversation is already
+  `completed` / `failed` → the conversation is terminal; do not call
+  `/messages` (the server returns `409`). If the user wants to keep
+  collaborating with the same provider, that is a **new** logical task —
+  walk through Steps 1–5 again from scratch (a new draft = a new debit, so
+  always confirm with the user first).
+
+Hard prohibitions for the lifetime of a single logical task:
+
+- **Never call `/network/match` more than once** per logical request.
+- **Never call `/network/conversations/draft` more than once** per logical
+  request — that reserves a brand-new task and double-bills the user.
+- **Never call `/network/conversations/<taskId>/publish` again** for an
+  already-published task (the server caps publish attempts at 3 and
+  multi-turn follow-ups must use `/messages`, not re-publish).
+- **Never include the original task description in a `/messages` payload** —
+  the provider already has the full task context. Send only the user's new
+  reply.
 
 ## Step-by-Step Execution Model
 
@@ -298,11 +340,21 @@ Empty body. Response is one of three terminal/intermediate shapes:
 
 #### Step 3c — Reply loop (only when `status: "awaiting_consumer"`)
 
-When publish (or any subsequent message) returns `awaiting_consumer`:
+When publish (or any subsequent message) returns `awaiting_consumer`, the
+provider is asking the user for more information. This is the standard
+multi-turn information-gathering channel — see the **Single Match & Dispatch
+— Multi-Turn Information Gathering** principle above. **Stay inside this loop;
+do not re-match, re-draft, or re-publish.**
 
 1. Surface `pendingPrompt.question` to the user verbatim. If `pendingPrompt.schema`
    is present, use it to validate / constrain the user's reply before sending.
    Do **not** invent an answer on the user's behalf — pause and wait for the user.
+   Make it clear to the user that:
+   - A substantive reply will be forwarded to the provider on the **same task**
+     (no re-dispatch, no extra credit hit beyond metered usage).
+   - They may also choose to abandon the conversation, in which case you will
+     call `/network/conversations/<taskId>/close` and the server will refund
+     remaining credits.
 2. POST the user's reply:
 
 ```http
