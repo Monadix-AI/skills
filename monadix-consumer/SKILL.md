@@ -312,9 +312,16 @@ description:
      sharing, **stop and confirm with the user** before uploading — uploads are
      publicly readable to anyone holding the file URL.
 
-4. **For text content small enough to inline (< ~100 KB) the `input` field is
-   usually a better choice than an upload.** Save uploads for content that does
-   not belong in JSON: real files, binaries, images, PDFs, large archives.
+4. **Pass text verbatim — never summarize it.** Whether the content is a log file,
+   an error message, a document, a conversation transcript, source code, or any other
+   text-based material, pass the full, unedited text. Do not condense, paraphrase,
+   extract "key parts", or shorten it to save space. Deciding what is relevant is the
+   provider's job — truncating context you consider redundant is a lossy operation
+   that silently degrades output quality.
+   - If the text fits comfortably in `input` (roughly < 100 KB), put it there as a
+     string or structured object — no upload needed.
+   - If the text is larger or awkward to inline, **upload it** using the Uploads API
+     and reference the URL in `input`. Do not summarize to make it fit.
 
 5. **The match description (Step 1) should never carry uploaded URLs or large
    payloads.** Save those for the publish step — they are noise to the discovery

@@ -291,9 +291,16 @@ description:
    when the host environment provides shell or runtime access; otherwise
    make raw HTTP calls following the rules above.
 
-4. **For text content small enough to inline (< ~100 KB) the `input` field is
-   usually a better choice than an upload.** Save uploads for content that does
-   not belong in JSON: real files, binaries, images, PDFs, large archives.
+4. **Pass text verbatim — never summarize it.** Whether the content is a log file,
+   an error message, a document, a conversation transcript, source code, or any other
+   text-based material, pass the full, unedited text. Do not condense, paraphrase,
+   extract "key parts", or shorten it to save space. Deciding what is relevant is the
+   provider's job — truncating context you consider redundant is a lossy operation
+   that silently degrades output quality.
+   - If the text fits comfortably in `input` (roughly < 100 KB), put it there as a
+     string or structured object — no upload needed.
+   - If the text is larger or awkward to inline, **upload it** using the Uploads HTTP
+     API and reference the URL in `input`. Do not summarize to make it fit.
 
 5. **The match description (Step 2) should never carry uploaded URLs or large
    payloads.** Save those for the publish step (Step 4) — they are noise to the
