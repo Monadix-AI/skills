@@ -12,7 +12,7 @@ description: |
 compatibility: Requires an HTTP client and an HMAC-SHA256 implementation. The skill bundle includes a `monadix.key` file (Bearer token) and a `monadix.signing-key` file (HMAC secret).
 metadata:
   author: Monadix
-  version: "16.2.0"
+  version: "17.0.0"
   api_base: "https://api.monadix.ai"
   category: collaboration-network
   tags: [consumer, collaboration-network, delegation, task-routing, capability-matching]
@@ -278,39 +278,84 @@ description:
 
    1. Mint a scope once per task: `POST /uploads/scopes` → `{ scopeId, limits }`.
       The `scopeId` (format `usc_*` followed by 18 alphanumeric chars) is a
-      capability. Anyone who sees it can upload to and list the scope's files,
-      so do **not** include it in the publish description, `input`, or any
-      message sent to the provider. Use it only for your own upload calls.
-   2. For each file the provider needs, send a single multipart POST:
-      `POST /uploads/scopes/<scopeId>/files` with one form part named `file`.
-      The response is `{ file: { url, originalName, sizeBytes, sha256Hex, ... } }`.
-      The `url` is publicly readable (no auth) at
-      `<SUPABASE_URL>/storage/v1/object/public/monadix-uploads/tasks/<scopeId>/<fileId>/<filename>`.
+      capability. Anyone who sees it can mint upload URLs into the scope and
+      list its files, so do **not** include it in the publish description,
+      `input`, or any message sent to the provider. Use it only for your own
+      sign / list calls.
+   2. For each file the provider needs, **mint a pre-signed upload URL** and
+      then PUT the file bytes directly to Supabase Storage. **This is a
+      mandatory two-call sequence — the file is NOT uploaded by `/sign` alone.**
+
+      a. `POST /uploads/scopes/<scopeId>/files/sign` with JSON body
+         `{ "filename": "...", "contentType": "..." }` (signed with the
+         normal `"<timestamp>.<rawBody>"` HMAC payload). The response is
+         `{ fileId, scopeId, storagePath, uploadUrl, publicUrl, method, requiredHeaders, originalName, maxFileSizeBytes, expiresAt }`.
+         At this point **no bytes have moved**; only a short-lived Supabase
+         token has been minted. The `publicUrl` will return `404` until step b
+         succeeds.
+
+      b. `PUT <uploadUrl>` directly against Supabase Storage, with the raw
+         file bytes as the request body and **every** header listed in
+         `requiredHeaders` (at minimum `Content-Type` set to exactly the
+         `contentType` you passed in step a — a mismatch causes Supabase to
+         reject the upload). **Do NOT send any Monadix headers** on this
+         request: no `Authorization`, no `X-Monadix-*`. The `?token=` query
+         parameter on `uploadUrl` is the credential, and it is consumed by
+         Supabase's Storage REST API (URL shape:
+         `https://<project>.supabase.co/storage/v1/object/upload/sign/monadix-uploads/<path>?token=<jwt>`).
+         Expect HTTP `200 OK` with a small JSON receipt (you can ignore it).
+         The signed URL expires at `expiresAt` (~2 hours after minting). Use
+         `uploadUrl` verbatim — it is fully-qualified by `/sign`; you do
+         **not** need to know the project's Supabase URL.
+
+         Concrete example:
+
+         ```sh
+         # Step a — sign (Monadix HMAC, returns uploadUrl + publicUrl)
+         curl -X POST 'https://api.monadix.ai/uploads/scopes/usc_AbCd.../files/sign' \
+           -H 'Authorization: Bearer <monadix.key>' \
+           -H 'X-Monadix-Timestamp: <ts>' \
+           -H 'X-Monadix-Signature: <hmac>' \
+           -H 'Content-Type: application/json' \
+           -d '{"filename":"contract.pdf","contentType":"application/pdf"}'
+
+         # Step b — PUT raw bytes straight to Supabase (no Monadix headers!)
+         curl -X PUT '<uploadUrl from step a>' \
+           -H 'Content-Type: application/pdf' \
+           --data-binary @./contract.pdf
+         ```
+
+         Equivalent in code: read the file into memory or stream it as the
+         `body` of a `PUT` to `uploadUrl`, copy `requiredHeaders` verbatim,
+         and check the response status before recording `publicUrl` as live.
+         Only after a successful `200` is `publicUrl` valid for the provider
+         to fetch.
    3. In the publish description (or, preferably, in `input`), list each file by
-      its public `url` along with a short one-line summary of what it contains.
-      This is the *only* thing the provider sees — the `scopeId` itself stays
-      private to the consumer.
+      its `publicUrl` along with a short one-line summary of what it contains.
+      `publicUrl` is returned fully-qualified by `/sign` (no auth required to
+      fetch it) — use it verbatim, do not try to construct it yourself.
+      This is the *only* thing the provider sees — the `scopeId` and the
+      one-shot `uploadUrl` itself stay private to the consumer.
 
    **Hard limits and rules:**
    - Per-file size cap: **25 MiB**. Larger files must be split or hosted elsewhere.
-   - Executable-style filename extensions are rejected server-side
+   - Executable-style filename extensions are rejected at sign time
      (`.exe .bat .cmd .com .sh .ps1 .vbs .js .jar .scr .msi .dll .app` and a few
-     more). Rename or repackage such files before uploading.
-   - **HMAC signing for `POST /uploads/scopes/<scopeId>/files` is different from
-     every other endpoint.** Because the body is a multi-megabyte multipart
-     stream, the signed payload is `"<timestamp>.POST:/uploads/scopes/<scopeId>/files"`
-     (literally the method, a colon, and the request path) — **not** the
-     request body. TLS provides transport integrity. Every other endpoint
-     (including `POST /uploads/scopes` and `GET /uploads/scopes/<scopeId>/files`)
-     uses the normal `"<timestamp>.<rawBody>"` payload as documented in the
-     Authentication section.
+     more). Rename or repackage such files before requesting a signed URL.
+   - **All Monadix-side calls (`POST /uploads/scopes`, `POST /uploads/scopes/<id>/files/sign`,
+     `GET /uploads/scopes/<id>/files`) use the standard `"<timestamp>.<rawBody>"`
+     HMAC payload** documented in the Authentication section. The PUT to
+     Supabase carries no Monadix credentials at all — the signed URL is the
+     credential.
+   - The signed URL is valid for ~2 hours. If the PUT fails with a 4xx, request
+     a fresh URL via `/sign`; never retry an expired one.
    - Treat the `scopeId` like a credential: never echo it to the provider, never
      embed it in chat messages, never log it. The whole point of two unguessable
-     segments in each URL (`scopeId` + `fileId`) is that leaking a *file* URL
-     reveals only that file's bytes, not the scope.
+     segments in each public URL (`scopeId` + `fileId`) is that leaking a *file*
+     URL reveals only that file's bytes, not the scope.
    - If a file contains sensitive content the user has not explicitly cleared for
-     sharing, **stop and confirm with the user** before uploading — uploads are
-     publicly readable to anyone holding the file URL.
+     sharing, **stop and confirm with the user** before uploading — once PUT,
+     the bytes are publicly readable to anyone holding the file URL.
 
 4. **Pass text verbatim — never summarize it.** Whether the content is a log file,
    an error message, a document, a conversation transcript, source code, or any other
@@ -1091,55 +1136,79 @@ Returns:
 Mint **once per task**. Reuse the same `scopeId` for every file that belongs
 to the same delegation; mint a fresh one for each independent task.
 
-#### Upload File (multipart — different HMAC payload!)
+#### Mint Pre-Signed Upload URL
 
 ```http
-POST https://api.monadix.ai/uploads/scopes/<scopeId>/files
+POST https://api.monadix.ai/uploads/scopes/<scopeId>/files/sign
 Authorization: Bearer <monadix.key contents>
 X-Monadix-Timestamp: <unix-ms>
-X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.POST:/uploads/scopes/<scopeId>/files")>
-Content-Type: multipart/form-data; boundary=...
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.<rawBody>")>
+Content-Type: application/json
 
---...
-Content-Disposition: form-data; name="file"; filename="contract.pdf"
-Content-Type: application/pdf
-
-<file bytes>
---...--
+{
+  "filename": "contract.pdf",
+  "contentType": "application/pdf"
+}
 ```
 
-**The signed payload for this endpoint alone is `"<timestamp>.<METHOD>:<path>"`
-— the request body is NOT included in the signature.** TLS guarantees
-transport integrity; this scheme avoids having to buffer multi-megabyte
-bodies just to compute their MAC.
+- `filename` (string, 1–255 chars, required) — original filename. Drives the
+  sanitised last segment of `publicUrl`.
+- `contentType` (string, optional, default `application/octet-stream`) — MIME
+  type. **Whatever you pass here MUST be sent verbatim as the `Content-Type`
+  header on the subsequent PUT**, otherwise Supabase rejects the upload.
+
+This endpoint uses the **standard** `"<timestamp>.<rawBody>"` HMAC payload —
+there is no method-path special case anymore.
 
 Response:
 
 ```json
 {
-  "file": {
-    "fileId": "upl_AbCdEf0123456789Gh",
-    "url": "https://<project>.supabase.co/storage/v1/object/public/monadix-uploads/tasks/usc_.../upl_.../contract.pdf",
-    "storagePath": "tasks/usc_.../upl_.../contract.pdf",
-    "originalName": "contract.pdf",
-    "contentType": "application/pdf",
-    "sizeBytes": 184321,
-    "sha256Hex": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-  }
+  "fileId": "upl_AbCdEf0123456789Gh",
+  "scopeId": "usc_AbCdEf0123456789Gh",
+  "storagePath": "tasks/usc_.../upl_.../contract.pdf",
+  "uploadUrl": "https://<project>.supabase.co/storage/v1/object/upload/sign/monadix-uploads/tasks/.../contract.pdf?token=<jwt>",
+  "publicUrl": "https://<project>.supabase.co/storage/v1/object/public/monadix-uploads/tasks/.../contract.pdf",
+  "method": "PUT",
+  "requiredHeaders": { "Content-Type": "application/pdf" },
+  "originalName": "contract.pdf",
+  "maxFileSizeBytes": 26214400,
+  "expiresAt": 1740007200000
 }
 ```
 
-The `url` is publicly readable with no auth — paste it into the publish
-description or `input` payload so the provider can fetch it.
+#### Upload File Bytes (PUT directly to Supabase — no Monadix auth)
 
-**Error responses:**
+```http
+PUT <uploadUrl>
+Content-Type: <exactly the contentType you passed to /sign>
 
-- `400 Bad Request` — missing `file` part, empty file, file > 25 MiB, blocked
-  filename extension, or malformed multipart body. Surface the message
-  verbatim and adjust the upload.
-- `401 Unauthorized` — see the Authentication section. Note the
-  method-path payload format above; signing the body by mistake will
-  produce `bad-signature` here.
+<raw file bytes>
+```
+
+- **No Monadix headers.** No `Authorization`, no `X-Monadix-*`. The `?token=`
+  query parameter on `uploadUrl` is the credential.
+- The body is the raw file bytes — not multipart, not base64, not JSON.
+- Expect HTTP `200 OK` (Supabase returns a small JSON receipt; you can
+  ignore it). On `4xx`, do **not** retry the same URL — mint a fresh one.
+- The URL expires at `expiresAt` from the sign response (~2 hours).
+
+**Why this two-step flow:** the agent never has to ship multi-megabyte bodies
+through the Monadix API, and the Monadix server never has to buffer or
+re-stream them. Bytes go directly from the consumer to Supabase Storage.
+
+**Error responses (from `/sign`):**
+
+- `400 Bad Request` — invalid `filename`, blocked filename extension, or
+  malformed JSON. Surface the message verbatim and adjust the request.
+- `401 Unauthorized` — see the Authentication section. This endpoint signs
+  the body, just like every other JSON endpoint.
+
+**Error responses (from the Supabase PUT):**
+
+- `400` / `403` — token expired or wrong `Content-Type`. Mint a fresh URL
+  via `/sign` (matching the `Content-Type` exactly) and retry.
+- `413` — file exceeds 25 MiB. Split the file; do not retry.
 
 #### List Files in a Scope
 
@@ -1150,7 +1219,7 @@ X-Monadix-Timestamp: <unix-ms>
 X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
 ```
 
-Returns `{ "files": UploadedFile[] }`. Useful for recovering URLs the agent
+Returns `{ "scopeId": "...", "files": [{ "fileId", "scopeId", "url", "storagePath", "originalName", "sizeBytes" }] }`. Useful for recovering URLs the agent
 already minted (e.g. after a process restart) without re-uploading.
 
 ---

@@ -231,7 +231,6 @@ def close_conversation(task_id: str, reason: str | None = None) -> dict:
 
 import mimetypes
 import os
-import secrets
 
 
 def create_upload_scope() -> dict:
@@ -251,12 +250,17 @@ def upload_file(
     filename: str | None = None,
     content_type: str | None = None,
 ) -> dict:
-    """Upload a single file to a scope.
+    """Upload a single file to a scope using the pre-signed PUT flow.
 
-    NOTE: HMAC signing for this endpoint signs ``"<timestamp>.<METHOD>:<path>"``
-    (method-path mode) — NOT the multipart body. This is the only endpoint
-    in the Monadix API that signs that way; every other endpoint signs the
-    raw body.
+    Two HTTP calls happen here:
+      1. ``POST /uploads/scopes/<scopeId>/files/sign`` (Monadix-signed JSON)
+         returns ``{uploadUrl, publicUrl, requiredHeaders, ...}``.
+      2. ``PUT <uploadUrl>`` with the raw file bytes and the required
+         ``Content-Type``. No Monadix credentials are sent on the PUT — the
+         URL itself is the credential.
+
+    Returns a flat dict ``{fileId, scopeId, storagePath, publicUrl,
+    originalName, sizeBytes, contentType}``.
     """
     local_file_path = Path(local_file_path)
     file_bytes = local_file_path.read_bytes()
@@ -265,56 +269,35 @@ def upload_file(
         mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
     )
 
-    # Build a minimal multipart/form-data body with a single ``file`` part.
-    boundary = "----monadixBoundary" + secrets.token_hex(16)
-    crlf = b"\r\n"
-    body_parts = [
-        f"--{boundary}".encode(),
-        (
-            f'Content-Disposition: form-data; name="file"; filename="{upload_name}"'
-        ).encode(),
-        f"Content-Type: {upload_type}".encode(),
-        b"",
-        file_bytes,
-        f"--{boundary}--".encode(),
-        b"",
-    ]
-    raw_body = crlf.join(body_parts)
+    # Step 1: mint a pre-signed upload URL via the standard Monadix HMAC flow.
+    signed = call_monadix(
+        f"/uploads/scopes/{scope_id}/files/sign",
+        {"filename": upload_name, "contentType": upload_type},
+    )
 
-    api_path = f"/uploads/scopes/{scope_id}/files"
-    api_key = _load_key("monadix.key")
-    signing_key = _load_key("monadix.signing-key")
-    timestamp = str(int(time.time() * 1000))
-    # Method-path HMAC mode: payload is "<timestamp>.<METHOD>:<path>".
-    # Body bytes are NOT signed.
-    signed_payload = f"{timestamp}.POST:{api_path}"
-    signature = hmac.new(
-        signing_key.encode(), signed_payload.encode(), hashlib.sha256
-    ).hexdigest()
-
-    req = urllib.request.Request(
-        f"https://api.monadix.ai{api_path}",
-        data=raw_body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "X-Monadix-Timestamp": timestamp,
-            "X-Monadix-Signature": signature,
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Content-Length": str(len(raw_body)),
-        },
-        method="POST",
+    # Step 2: PUT the raw bytes directly to Supabase Storage. No Monadix headers.
+    put_req = urllib.request.Request(
+        signed["uploadUrl"],
+        data=file_bytes,
+        headers=signed["requiredHeaders"],
+        method="PUT",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            text = resp.read().decode()
-            return json.loads(text) if text else {}
+        with urllib.request.urlopen(put_req, timeout=120) as resp:
+            resp.read()  # drain Supabase receipt; we don't need it
     except urllib.error.HTTPError as err:
         text = err.read().decode() if err.fp else ""
-        try:
-            parsed = json.loads(text) if text else {}
-        except json.JSONDecodeError:
-            parsed = {"raw": text}
-        raise MonadixAPIError(err.code, parsed, text) from err
+        raise MonadixAPIError(err.code, {"raw": text}, text) from err
+
+    return {
+        "fileId": signed["fileId"],
+        "scopeId": signed["scopeId"],
+        "storagePath": signed["storagePath"],
+        "publicUrl": signed["publicUrl"],
+        "originalName": signed["originalName"],
+        "sizeBytes": len(file_bytes),
+        "contentType": upload_type,
+    }
 
 
 def list_scope_files(scope_id: str) -> dict:

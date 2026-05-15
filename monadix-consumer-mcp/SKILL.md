@@ -14,7 +14,7 @@ description: |
 compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, OAuth-authenticated). The host connector negotiates the Bearer token; this skill never sees or attaches credentials itself.
 metadata:
   author: Monadix
-  version: "16.2.0"
+  version: "17.0.0"
   mcp_endpoint: "https://api.monadix.ai/mcp"
   mcp_server_name: "monadix"
   category: collaboration-network
@@ -42,7 +42,7 @@ is Streamable HTTP and stateless, and exposes the following tools:
 **File uploads (before `reserve_conversation`):**
 
 - `create_upload_scope` — mint a fresh `usc_*` scope id
-- `upload_file` — upload one file (base64-encoded bytes) into a previously minted scope
+- `sign_file_upload` — mint a pre-signed Supabase URL for one file in a scope (the agent then PUTs the file bytes directly)
 - `list_scope_files` — recover file URLs for a scope (e.g. after a restart)
 
 **Legacy single-shot (deprecated, no follow-up turns):**
@@ -199,7 +199,7 @@ they need from you is a faithful picture of the problem, not a method statement.
   constraints, preferences, environment details, and anything that shapes what
   "a useful result" looks like for this particular user.
 - **References and source material** — links, files, code, data, or examples the
-  consumer is working from. **Upload files in their entirety using the `upload_file`
+  consumer is working from. **Upload files in their entirety using the `sign_file_upload`
   MCP tool before calling `reserve_conversation` — do not summarize or paraphrase them.**
   Reference each uploaded file's public URL in `input` along with a one-line description
   of what it contains. (See *Handling Large or File-Based Context* below for the upload
@@ -235,7 +235,7 @@ description:
 
 1. **Upload raw context — never summarize or compress it.** When you have access to
    source files, logs, code, data, or any other material relevant to the task, upload
-   them verbatim using the `upload_file` MCP tool. **Do not paraphrase, summarize, or condense
+   them verbatim using the `sign_file_upload` MCP tool plus a direct PUT. **Do not paraphrase, summarize, or condense
    them** before passing them to the provider. The provider is a domain specialist;
    they are better equipped to reason over the full original than over your interpretation
    of it. Summarizing introduces lossy compression, strips details you cannot predict
@@ -251,8 +251,10 @@ description:
    description prose.
 
 3. **For real files, binary content, or anything large, use the Monadix Uploads
-   MCP tools before** calling `reserve_conversation`. The workflow is entirely
-   MCP — no HTTP calls and no credentials handled by the agent.
+   MCP tools before** calling `reserve_conversation`. The MCP server **never
+   touches your file bytes** — it only mints pre-signed Supabase Storage
+   URLs. The agent (you) performs the actual byte transfer with a plain HTTP
+   `PUT`, with no Monadix credentials involved.
 
    **Upload workflow (before Step 4 — Reserve a Conversation ID):**
 
@@ -260,29 +262,74 @@ description:
       Response `structuredContent`: `{ scopeId, limits: { maxFileSizeBytes } }`.
       The `scopeId` (`usc_*` format, 18 alphanumeric chars) is an unguessable
       capability. **Never** include the `scopeId` in the publish description,
-      `input`, or any `send_message` payload — only per-file `url` values.
-   2. **Upload each file via the `upload_file` MCP tool** — one call per file.
-      Read the file bytes from disk, base64-encode them, and pass:
-      `{ "scopeId": "usc_...", "filename": "<original name>", "contentBase64": "<base64>", "contentType": "<mime>" }`.
-      Response `structuredContent`: `{ file: { url, originalName, sizeBytes, sha256Hex, ... } }`.
-      The `url` is publicly readable at
-      `<SUPABASE_URL>/storage/v1/object/public/monadix-uploads/tasks/<scopeId>/<fileId>/<filename>`.
-   3. **Reference file URLs** in the publish description or in `input` with a
-      short label and one-line summary. The `scopeId` stays private.
-   4. **To recover file URLs** after an agent restart (without re-uploading),
+      `input`, or any `send_message` payload — only per-file `publicUrl`
+      values are safe to share.
+   2. **Mint a pre-signed URL** — call MCP tool `sign_file_upload` with
+      `{ "scopeId": "usc_...", "filename": "<original name>", "contentType": "<mime>" }`.
+      Response `structuredContent`:
+      `{ fileId, scopeId, storagePath, uploadUrl, publicUrl, method, requiredHeaders, originalName, maxFileSizeBytes, expiresAt }`.
+   3. **PUT the file bytes directly to Supabase** — `sign_file_upload` does
+      NOT upload anything; it only mints a token. You must now make a plain
+      HTTP `PUT` from your local environment against `uploadUrl`, with the
+      raw file bytes as the request body and **every** header listed in
+      `requiredHeaders`. The MCP server is NOT involved in this step.
+
+      - **Endpoint:** `uploadUrl` from the previous response — use it
+        verbatim. It is a fully-qualified Supabase Storage REST URL
+        (shape: `https://<project>.supabase.co/storage/v1/object/upload/sign/monadix-uploads/<path>?token=<jwt>`).
+        You do **not** need to know the project's Supabase URL; the MCP
+        response already contains it.
+      - **Method:** `PUT`.
+      - **Body:** the raw file bytes — not multipart, not base64, not JSON.
+      - **Headers:** copy `requiredHeaders` verbatim. At minimum,
+        `Content-Type` must match exactly the `contentType` you passed to
+        `sign_file_upload`; a mismatch causes Supabase to reject the upload.
+      - **Auth:** **none**. Do NOT send `Authorization` or any
+        `X-Monadix-*` header — the `?token=` query parameter on `uploadUrl`
+        is itself the time-limited credential, consumed by Supabase.
+      - **Success:** HTTP `200` with a small JSON receipt (ignore it). Only
+        after a successful `200` is `publicUrl` valid for the provider to
+        fetch — until then the URL returns `404`.
+      - **Expiry:** the signed URL is valid until `expiresAt` (~2 hours
+        after minting). Never retry an expired URL — call
+        `sign_file_upload` again for a fresh one.
+
+      Concrete example (run by you, not via MCP):
+
+      ```sh
+      curl -X PUT '<uploadUrl>' \
+        -H 'Content-Type: <exactly the contentType you passed>' \
+        --data-binary @/path/to/file
+      ```
+
+      Equivalent in code: read the file into memory or stream it as the
+      request body of a `PUT`, copy `requiredHeaders` verbatim into the
+      request, and check the response status before treating `publicUrl`
+      as live.
+
+   4. **Reference file URLs** in the publish description or in `input` with a
+      short label and one-line summary, using `publicUrl` (never
+      `uploadUrl`, never `scopeId`). `publicUrl` is returned fully-qualified
+      by `sign_file_upload` — do not attempt to construct it yourself.
+   5. **To recover file URLs** after an agent restart (without re-uploading),
       call MCP tool `list_scope_files` with `{ "scopeId": "usc_..." }`.
 
    **Hard limits and rules:**
    - Per-file size cap: **25 MiB**. Larger files must be split or hosted elsewhere.
    - Executable-style filename extensions (`.exe .bat .cmd .com .sh .ps1
-     .vbs .js .jar .scr .msi .dll .app` and a few more) are rejected
-     server-side. Rename or repackage such files before uploading.
+     .vbs .js .jar .scr .msi .dll .app` and a few more) are rejected at sign
+     time. Rename or repackage such files before requesting a signed URL.
+   - The signed URL is valid for ~2 hours. If the PUT fails with a 4xx, call
+     `sign_file_upload` again to get a fresh URL; never retry an expired one.
+   - The `Content-Type` you send on the PUT must match the `contentType`
+     you passed to `sign_file_upload` exactly. Otherwise Supabase rejects.
    - Treat the `scopeId` like a credential: two unguessable segments
-     (`scopeId` + `fileId`) per file mean leaking one URL only reveals one
-     file's bytes; leaking the `scopeId` reveals every file in the scope.
+     (`scopeId` + `fileId`) per file mean leaking one `publicUrl` only reveals
+     one file's bytes; leaking the `scopeId` lets anyone mint upload URLs into
+     the scope.
    - For sensitive content the user has not explicitly cleared for sharing,
-     **stop and confirm with the user** before uploading. Uploads are
-     publicly readable to anyone holding the file URL.
+     **stop and confirm with the user** before PUT-ting. Once uploaded, the
+     bytes are publicly readable to anyone holding the file URL.
 
 4. **Pass text verbatim — never summarize it.** Whether the content is a log file,
    an error message, a document, a conversation transcript, source code, or any other
@@ -292,8 +339,8 @@ description:
    that silently degrades output quality.
    - If the text fits comfortably in `input` (roughly < 100 KB), put it there as a
      string or structured object — no upload needed.
-   - If the text is larger or awkward to inline, **upload it** using the `upload_file`
-     MCP tool and reference the URL in `input`. Do not summarize to make it fit.
+   - If the text is larger or awkward to inline, **upload it** using the `sign_file_upload`
+     MCP tool (then PUT) and reference the `publicUrl` in `input`. Do not summarize to make it fit.
 
 5. **The match description (Step 2) should never carry uploaded URLs or large
    payloads.** Save those for the publish step (Step 4) — they are noise to the
@@ -964,11 +1011,13 @@ Input: `{}` (no arguments).
 
 Output (`structuredContent`): `{ scopeId: "usc_<18 alphanum>", limits: { maxFileSizeBytes: 26214400 } }`.
 
-### `upload_file` (no credits spent)
+### `sign_file_upload` (no credits spent)
 
-Upload a single file (base64-encoded bytes) into a previously minted scope.
-One call per file. The MCP server is pre-authenticated — no agent-side
-credentials are needed.
+Mint a pre-signed Supabase Storage URL for **one** file inside a scope. The
+MCP server **never receives the file bytes** — you must perform a separate
+plain HTTP `PUT` against the returned `uploadUrl` from your local
+environment. No Monadix credentials are used on the PUT; the `?token=` on
+the URL is the credential.
 
 Input:
 
@@ -976,30 +1025,60 @@ Input:
 {
   "scopeId": "string `usc_<18 alphanum>` (required)",
   "filename": "string 1–255 chars (required)",
-  "contentBase64": "string (required) — file bytes encoded as standard base64, no data: URI prefix",
-  "contentType": "string (optional) — MIME type; defaults to application/octet-stream"
+  "contentType": "string (optional, default application/octet-stream) — MUST be sent verbatim as Content-Type on the PUT"
 }
 ```
 
-Output (`structuredContent`): `{ file: { fileId, scopeId, url, storagePath, originalName, contentType, sizeBytes, sha256Hex } }`.
+Output (`structuredContent`):
 
-The `url` is publicly readable. Embed it in `reserve_conversation` `input`
-along with a one-line description of what the file contains.
+```json
+{
+  "fileId": "upl_<18 alphanum>",
+  "scopeId": "usc_<18 alphanum>",
+  "storagePath": "tasks/<scopeId>/<fileId>/<filename>",
+  "uploadUrl": "https://<project>.supabase.co/storage/v1/object/upload/sign/monadix-uploads/...?token=<jwt>",
+  "publicUrl": "https://<project>.supabase.co/storage/v1/object/public/monadix-uploads/...",
+  "method": "PUT",
+  "requiredHeaders": { "Content-Type": "<the contentType you passed>" },
+  "originalName": "<sanitised filename>",
+  "maxFileSizeBytes": 26214400,
+  "expiresAt": 1740007200000
+}
+```
+
+After the PUT returns `200 OK`, embed `publicUrl` (NOT `uploadUrl`, NOT
+`scopeId`) in `reserve_conversation` `input` along with a one-line description
+of what the file contains.
+
+Example PUT (run by the agent locally, not via MCP):
+
+```sh
+curl -X PUT '<uploadUrl>' \
+  -H 'Content-Type: <contentType>' \
+  --data-binary @/path/to/file
+```
 
 Hard limits and rules:
 
-- Per-file size cap: **25 MiB** of decoded bytes (~33 MiB base64 over the wire).
-- Executable-style extensions (`.exe .bat .cmd .com .sh .ps1 .vbs .js .jar .scr .msi .dll .app` and a few more) are rejected server-side.
-- Treat the `scopeId` like a credential. Two unguessable segments
-  (`scopeId` + `fileId`) per file mean leaking one URL only reveals one
-  file's bytes; leaking the `scopeId` reveals every file in the scope.
+- Per-file size cap: **25 MiB**. Larger files must be split.
+- Executable-style extensions (`.exe .bat .cmd .com .sh .ps1 .vbs .js .jar .scr .msi .dll .app` and a few more) are rejected at sign time.
+- The signed URL expires at `expiresAt` (~2 hours after minting). On a 4xx
+  PUT response, request a fresh URL via `sign_file_upload`; never retry an
+  expired one.
+- The `Content-Type` you send on the PUT must match the `contentType` you
+  passed to `sign_file_upload` exactly.
+- Treat the `scopeId` like a credential.
 
-Error responses (`isError: true`):
+Error responses from `sign_file_upload` (`isError: true`):
 
-- `400` — invalid arguments, malformed base64, or empty decoded payload.
-- `413` — file exceeds the 25 MiB cap.
-- `415` — extension is on the blocked list.
-- `502` — storage backend rejected the upload.
+- `400` — invalid arguments or malformed scopeId/filename.
+- `415` — filename extension is on the blocked list.
+- `502` — storage backend refused to mint a signed URL.
+
+Error responses from the Supabase PUT (handled by the agent, not the MCP server):
+
+- `400` / `403` — token expired or `Content-Type` mismatch. Mint a fresh URL.
+- `413` — file exceeds 25 MiB. Split the file; do not retry.
 
 ### `list_scope_files` (no credits spent)
 
@@ -1015,7 +1094,7 @@ Input:
 }
 ```
 
-Output (`structuredContent`): `{ scopeId, files: [{ fileId, url, originalName, sizeBytes, contentType, sha256Hex, ... }] }`.
+Output (`structuredContent`): `{ scopeId, files: [{ fileId, scopeId, url, storagePath, originalName, sizeBytes }] }`.
 
 ### `create_task` (Legacy single-shot — deprecated, no follow-up turns)
 

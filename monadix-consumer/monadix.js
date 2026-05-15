@@ -288,58 +288,56 @@ async function createUploadScope() {
 }
 
 /**
- * Upload a single file to a scope.
+ * Upload a single file to a scope using the pre-signed PUT flow.
  *
- * NOTE: HMAC signing for the upload endpoint signs `<timestamp>.<METHOD>:<path>`
- * (method-path mode) — NOT the multipart body. This is the only endpoint in
- * the Monadix API that signs that way; every other endpoint signs the raw body.
+ * Two HTTP calls happen here:
+ *   1. POST /uploads/scopes/<scopeId>/files/sign  (Monadix-signed JSON)
+ *      -> { uploadUrl, publicUrl, requiredHeaders, ... }
+ *   2. PUT <uploadUrl> with the raw file bytes and the required Content-Type.
+ *      No Monadix credentials are sent on the PUT — the URL is the credential.
  *
  * @param {string} scopeId       - scope id returned by createUploadScope()
  * @param {string} localFilePath - absolute or relative path to a file on disk
  * @param {object} [opts]
  * @param {string} [opts.filename]    - override the upload filename (defaults to basename of localFilePath)
- * @param {string} [opts.contentType] - override the multipart Content-Type (defaults to application/octet-stream)
- * @returns {Promise<{ file: { fileId: string, url: string, storagePath: string, originalName: string, contentType: string, sizeBytes: number, sha256Hex: string } }>}
+ * @param {string} [opts.contentType] - Content-Type used both at sign time and for the PUT (defaults to application/octet-stream)
+ * @returns {Promise<{ fileId: string, scopeId: string, storagePath: string, publicUrl: string, originalName: string, sizeBytes: number, contentType: string }>}
  */
 async function uploadFile(scopeId, localFilePath, opts) {
   opts = opts || {};
-  var apiKey = loadKey('monadix.key');
-  var signingKey = loadKey('monadix.signing-key');
 
   var bytes = fs.readFileSync(localFilePath);
   var filename = opts.filename || path.basename(localFilePath);
   var contentType = opts.contentType || 'application/octet-stream';
 
-  // FormData is global in Node.js 18+.
-  var form = new FormData();
-  form.append('file', new Blob([bytes], { type: contentType }), filename);
+  // Step 1: mint a pre-signed upload URL via the standard Monadix HMAC flow.
+  var signed = await callMonadix(
+    '/uploads/scopes/' + encodeURIComponent(scopeId) + '/files/sign',
+    { filename: filename, contentType: contentType }
+  );
 
-  var apiPath = '/uploads/scopes/' + encodeURIComponent(scopeId) + '/files';
-  var timestamp = Date.now().toString();
-  // Method-path HMAC mode: payload is `<timestamp>.<METHOD>:<path>`. Body bytes are NOT signed.
-  var signature = crypto.createHmac('sha256', signingKey)
-    .update(timestamp + '.POST:' + apiPath)
-    .digest('hex');
-
-  var res = await fetch('https://api.monadix.ai' + apiPath, {
-    method: 'POST',
-    headers: {
-      'Authorization': 'Bearer ' + apiKey,
-      'X-Monadix-Timestamp': timestamp,
-      'X-Monadix-Signature': signature,
-    },
-    body: form,
+  // Step 2: PUT the raw bytes directly to Supabase Storage. No Monadix headers.
+  var putRes = await fetch(signed.uploadUrl, {
+    method: 'PUT',
+    headers: signed.requiredHeaders,
+    body: bytes,
   });
-  var text = await res.text();
-  var parsed;
-  try { parsed = text ? JSON.parse(text) : null; } catch (_) { parsed = null; }
-  if (!res.ok) {
-    var err = new Error('Monadix upload error: ' + res.status + ' ' + text);
-    err.status = res.status;
-    err.body = parsed;
+  if (!putRes.ok) {
+    var putText = await putRes.text();
+    var err = new Error('Storage PUT failed: ' + putRes.status + ' ' + putText);
+    err.status = putRes.status;
     throw err;
   }
-  return parsed;
+
+  return {
+    fileId: signed.fileId,
+    scopeId: signed.scopeId,
+    storagePath: signed.storagePath,
+    publicUrl: signed.publicUrl,
+    originalName: signed.originalName,
+    sizeBytes: bytes.length,
+    contentType: contentType,
+  };
 }
 
 /**
