@@ -39,6 +39,11 @@ is Streamable HTTP and stateless, and exposes the following tools:
 - `close_conversation` — abort an active conversation (idempotent)
 - `get_conversation` — read the full transcript
 
+**File uploads (before `reserve_conversation`):**
+
+- `create_upload_scope` — mint a fresh `usc_*` scope id; then upload each file via HTTP multipart POST
+- `list_scope_files` — recover file URLs for a scope (e.g. after a restart)
+
 **Legacy single-shot (deprecated, no follow-up turns):**
 
 - `create_task` — single synchronous call; fails the task if the provider asks a clarifying question
@@ -249,48 +254,42 @@ description:
    description prose.
 
 3. **For real files, binary content, or anything large, use the Monadix Uploads
-   HTTP API** (`POST /uploads/scopes` and `POST /uploads/scopes/<scopeId>/files`)
-   **before** calling `reserve_conversation`. MCP tool calls are not the right
-   transport for multi-megabyte multipart bodies, so this single operation lives
-   on the HTTP side. The flow is:
+   API before** calling `reserve_conversation`. The workflow splits into two
+   parts: scope creation (MCP tool) and the actual file upload (HTTP multipart).
 
-   1. Mint a scope: `POST https://api.monadix.ai/uploads/scopes` (JSON body `{}`) →
-      `{ scopeId, limits: { maxFileSizeBytes } }`. The `scopeId` (format
-      `usc_*` followed by 18 alphanumeric chars) is an unguessable capability.
-      **Never** include the `scopeId` in the publish description, `input`, or
-      any `send_message` payload — only the per-file `url` values.
-   2. For each file: `POST https://api.monadix.ai/uploads/scopes/<scopeId>/files`
-      with a single multipart part named `file`. Response:
-      `{ file: { url, originalName, sizeBytes, sha256Hex, ... } }`. The `url`
-      is publicly readable and lives at
+   **Upload workflow (before Step 4 — Reserve a Conversation ID):**
+
+   1. **Mint a scope** — call MCP tool `create_upload_scope` (no arguments).
+      Response `structuredContent`: `{ scopeId, limits: { maxFileSizeBytes } }`.
+      The `scopeId` (`usc_*` format, 18 alphanumeric chars) is an unguessable
+      capability. **Never** include the `scopeId` in the publish description,
+      `input`, or any `send_message` payload — only per-file `url` values.
+   2. **Upload each file via HTTP multipart POST** — MCP tool calls are not the
+      right transport for multi-megabyte binary bodies, so this step is HTTP-only:
+      `POST https://api.monadix.ai/uploads/scopes/<scopeId>/files` with a single
+      form-part named `file`. Response: `{ file: { url, originalName, sizeBytes, sha256Hex, ... } }`.
+      The `url` is publicly readable at
       `<SUPABASE_URL>/storage/v1/object/public/monadix-uploads/tasks/<scopeId>/<fileId>/<filename>`.
-   3. Reference each file URL in the publish description or in `input` with a
-      short label and one-line summary of what the file contains.
+      Authentication uses the MCP connector's Bearer token (the host attaches it
+      automatically when making HTTP calls on behalf of the user). For HMAC-signed
+      API key callers, the multipart upload signs `"<timestamp>.POST:/uploads/scopes/<scopeId>/files"`
+      (method-path mode) — **not** the request body.
+   3. **Reference file URLs** in the publish description or in `input` with a
+      short label and one-line summary. The `scopeId` stays private.
+   4. **To recover file URLs** after an agent restart (without re-uploading),
+      call MCP tool `list_scope_files` with `{ "scopeId": "usc_..." }`.
 
-   **Hard rules:**
-   - Per-file size cap is **25 MiB**. Larger files must be split or hosted
-     elsewhere.
+   **Hard limits and rules:**
+   - Per-file size cap: **25 MiB**. Larger files must be split or hosted elsewhere.
    - Executable-style filename extensions (`.exe .bat .cmd .com .sh .ps1
      .vbs .js .jar .scr .msi .dll .app` and a few more) are rejected
      server-side. Rename or repackage such files before uploading.
-   - Authentication for the Uploads HTTP API uses the same Bearer + HMAC
-     scheme as the rest of the Monadix network. **HMAC for the multipart
-     upload endpoint signs `"<timestamp>.POST:/uploads/scopes/<scopeId>/files"`
-     (method-path mode) — NOT the request body.** Every other endpoint
-     (including `POST /uploads/scopes`, which sends a `{}` JSON body) signs
-     the raw body as usual — e.g. `POST /uploads/scopes` signs `"<timestamp>.{}"`.
-   - Treat the `scopeId` like a credential. Two unguessable segments
+   - Treat the `scopeId` like a credential: two unguessable segments
      (`scopeId` + `fileId`) per file mean leaking one URL only reveals one
      file's bytes; leaking the `scopeId` reveals every file in the scope.
    - For sensitive content the user has not explicitly cleared for sharing,
      **stop and confirm with the user** before uploading. Uploads are
      publicly readable to anyone holding the file URL.
-
-   The `monadix-consumer` (HTTP) skill bundles ready-to-use helpers
-   (`createUploadScope` / `uploadFile` in `monadix.js`,
-   `create_upload_scope` / `upload_file` in `monadix.py`). Reach for those
-   when the host environment provides shell or runtime access; otherwise
-   make raw HTTP calls following the rules above.
 
 4. **Pass text verbatim — never summarize it.** Whether the content is a log file,
    an error message, a document, a conversation transcript, source code, or any other
