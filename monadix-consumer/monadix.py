@@ -219,6 +219,112 @@ def close_conversation(task_id: str, reason: str | None = None) -> dict:
         return {"error": str(err)}
 
 
+# ---------------------------------------------------------------------------
+# Uploads primitives (file attachments)
+# ---------------------------------------------------------------------------
+#
+# Use BEFORE Step 3a (Reserve a Conversation ID) whenever the task involves
+# real files (binaries, PDFs, images, large text). Mint one scope per task,
+# upload each file, then paste the returned public URLs into the publish
+# description or ``input`` payload — never paste the ``scopeId`` itself, it
+# is a capability.
+
+import mimetypes
+import os
+import secrets
+
+
+def create_upload_scope() -> dict:
+    """Mint a fresh upload scope.
+
+    Returns ``{"scopeId": "usc_...", "limits": {"maxFileSizeBytes": ...}}``.
+    The ``scopeId`` is an unguessable capability — keep it private to the
+    consumer.
+    """
+    return call_monadix("/uploads/scopes", {})
+
+
+def upload_file(
+    scope_id: str,
+    local_file_path: str | os.PathLike,
+    *,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> dict:
+    """Upload a single file to a scope.
+
+    NOTE: HMAC signing for this endpoint signs ``"<timestamp>.<METHOD>:<path>"``
+    (method-path mode) — NOT the multipart body. This is the only endpoint
+    in the Monadix API that signs that way; every other endpoint signs the
+    raw body.
+    """
+    local_file_path = Path(local_file_path)
+    file_bytes = local_file_path.read_bytes()
+    upload_name = filename or local_file_path.name
+    upload_type = content_type or (
+        mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
+    )
+
+    # Build a minimal multipart/form-data body with a single ``file`` part.
+    boundary = "----monadixBoundary" + secrets.token_hex(16)
+    crlf = b"\r\n"
+    body_parts = [
+        f"--{boundary}".encode(),
+        (
+            f'Content-Disposition: form-data; name="file"; filename="{upload_name}"'
+        ).encode(),
+        f"Content-Type: {upload_type}".encode(),
+        b"",
+        file_bytes,
+        f"--{boundary}--".encode(),
+        b"",
+    ]
+    raw_body = crlf.join(body_parts)
+
+    api_path = f"/uploads/scopes/{scope_id}/files"
+    api_key = _load_key("monadix.key")
+    signing_key = _load_key("monadix.signing-key")
+    timestamp = str(int(time.time() * 1000))
+    # Method-path HMAC mode: payload is "<timestamp>.<METHOD>:<path>".
+    # Body bytes are NOT signed.
+    signed_payload = f"{timestamp}.POST:{api_path}"
+    signature = hmac.new(
+        signing_key.encode(), signed_payload.encode(), hashlib.sha256
+    ).hexdigest()
+
+    req = urllib.request.Request(
+        f"https://api.monadix.ai{api_path}",
+        data=raw_body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "X-Monadix-Timestamp": timestamp,
+            "X-Monadix-Signature": signature,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(raw_body)),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            text = resp.read().decode()
+            return json.loads(text) if text else {}
+    except urllib.error.HTTPError as err:
+        text = err.read().decode() if err.fp else ""
+        try:
+            parsed = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            parsed = {"raw": text}
+        raise MonadixAPIError(err.code, parsed, text) from err
+
+
+def list_scope_files(scope_id: str) -> dict:
+    """List files already uploaded into a scope.
+
+    Useful for recovering URLs after a process restart without re-uploading.
+    """
+    return get_monadix(f"/uploads/scopes/{scope_id}/files")
+
+
 def delegate_task(description: str, input_data: dict | None = None) -> None:
     """
     Full delegation workflow (step-by-step — pauses at each boundary):

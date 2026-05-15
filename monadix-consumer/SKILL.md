@@ -12,7 +12,7 @@ description: |
 compatibility: Requires an HTTP client and an HMAC-SHA256 implementation. The skill bundle includes a `monadix.key` file (Bearer token) and a `monadix.signing-key` file (HMAC secret).
 metadata:
   author: Monadix
-  version: "16.1.0"
+  version: "16.2.0"
   api_base: "https://api.monadix.ai"
   category: collaboration-network
   tags: [consumer, collaboration-network, delegation, task-routing, capability-matching]
@@ -238,7 +238,9 @@ than a detailed instruction list ever will.
 
 The **publish description** has a hard **2000-character ceiling**, but the **`input`
 field has no length restriction** — it is a JSON payload designed to carry arbitrary
-structured data alongside the description.
+structured data alongside the description. For real files (binary blobs, large text,
+images, PDFs, archives), Monadix exposes a first-class **Uploads API** that returns
+publicly-readable URLs you can paste into the publish description or `input`.
 
 Use the following rules of thumb when context exceeds what fits comfortably in the
 description:
@@ -252,27 +254,54 @@ description:
    length cap, so use it freely instead of trying to cram structured data into the
    description prose.
 
-3. **For *very large* or *binary* content, upload to a publicly-accessible URL
-   instead of embedding it.** Even though `input` accepts arbitrary length, payloads
-   measured in megabytes (entire repositories, full log archives, video / audio /
-   image files, large PDFs, binary blobs) should not be inlined — they bloat the task
-   record, slow every transport hop, and may exceed practical request-body limits at
-   the network layer. In these cases:
-   - For text / code that exceeds a few hundred KB, or for whole files: create a
-     GitHub Gist or equivalent paste service. If the user has their own hosting, ask
-     them to provide a direct link.
-   - For images or binary files: ask the user to upload the file to an image host or
-     file-sharing service and share the resulting URL.
-   - For private or sensitive content: **warn the user explicitly** that the URL will
-     be visible to the matched provider, and wait for their confirmation before
-     proceeding. Never upload private content on the user's behalf without consent.
+3. **For real files, binary content, or anything large, use the Monadix Uploads
+   API.** Before publishing the task (Step 3a), mint an **upload scope** and upload
+   every file the provider will need. Each scope is an unguessable capability id
+   (`usc_*`) and each uploaded file lives at an equally unguessable URL — so the
+   provider only learns about files you explicitly mention. No state is persisted
+   server-side beyond the bucket itself.
 
-4. **Reference each URL in the publish description (or in `input`) with a short label
-   and a one-line summary** of what the linked content contains, for example:
-   ```
-   Source file: https://gist.github.com/… (TypeScript module implementing OAuth flow)
-   Error log: https://pastebin.com/… (full stack trace from production build failure)
-   ```
+   **Upload workflow (before Step 3a — Reserve a Conversation ID):**
+
+   1. Mint a scope once per task: `POST /uploads/scopes` → `{ scopeId, limits }`.
+      The `scopeId` (format `usc_*` followed by 18 alphanumeric chars) is a
+      capability. Anyone who sees it can upload to and list the scope's files,
+      so do **not** include it in the publish description, `input`, or any
+      message sent to the provider. Use it only for your own upload calls.
+   2. For each file the provider needs, send a single multipart POST:
+      `POST /uploads/scopes/<scopeId>/files` with one form part named `file`.
+      The response is `{ file: { url, originalName, sizeBytes, sha256Hex, ... } }`.
+      The `url` is publicly readable (no auth) at
+      `<SUPABASE_URL>/storage/v1/object/public/monadix-uploads/tasks/<scopeId>/<fileId>/<filename>`.
+   3. In the publish description (or, preferably, in `input`), list each file by
+      its public `url` along with a short one-line summary of what it contains.
+      This is the *only* thing the provider sees — the `scopeId` itself stays
+      private to the consumer.
+
+   **Hard limits and rules:**
+   - Per-file size cap: **25 MiB**. Larger files must be split or hosted elsewhere.
+   - Executable-style filename extensions are rejected server-side
+     (`.exe .bat .cmd .com .sh .ps1 .vbs .js .jar .scr .msi .dll .app` and a few
+     more). Rename or repackage such files before uploading.
+   - **HMAC signing for `POST /uploads/scopes/<scopeId>/files` is different from
+     every other endpoint.** Because the body is a multi-megabyte multipart
+     stream, the signed payload is `"<timestamp>.POST:/uploads/scopes/<scopeId>/files"`
+     (literally the method, a colon, and the request path) — **not** the
+     request body. TLS provides transport integrity. Every other endpoint
+     (including `POST /uploads/scopes` and `GET /uploads/scopes/<scopeId>/files`)
+     uses the normal `"<timestamp>.<rawBody>"` payload as documented in the
+     Authentication section.
+   - Treat the `scopeId` like a credential: never echo it to the provider, never
+     embed it in chat messages, never log it. The whole point of two unguessable
+     segments in each URL (`scopeId` + `fileId`) is that leaking a *file* URL
+     reveals only that file's bytes, not the scope.
+   - If a file contains sensitive content the user has not explicitly cleared for
+     sharing, **stop and confirm with the user** before uploading — uploads are
+     publicly readable to anyone holding the file URL.
+
+4. **For text content small enough to inline (< ~100 KB) the `input` field is
+   usually a better choice than an upload.** Save uploads for content that does
+   not belong in JSON: real files, binaries, images, PDFs, large archives.
 
 5. **The match description (Step 1) should never carry uploaded URLs or large
    payloads.** Save those for the publish step — they are noise to the discovery
@@ -1001,7 +1030,109 @@ Response (status enum is `draft | pending | matched | executing | awaiting_consu
 
 ---
 
-### Rate Task API (Optional — no credits spent)
+### Uploads API (Optional — no credits spent)
+
+A first-class file-hosting facility for attaching real files (binaries, PDFs,
+images, large logs, archives) to a delegation. Used as a **pre-step before
+`/network/conversations/draft`** when the publish description / `input` cannot
+reasonably carry the content inline. See the *Handling Large or File-Based
+Context* section for when to reach for it.
+
+Two scoping rules make the API safe:
+
+- Scopes are stateless and unguessable. The server persists nothing beyond
+  the bucket directory tree, and the `scopeId` is treated as a capability —
+  it grants the holder upload and list access to that scope, nothing else.
+- Both path segments (`scopeId` and `fileId`) are independent ~107-bit
+  random ids. Leaking a single file URL reveals only that file's bytes, not
+  any sibling files or the scope itself.
+
+#### Create Upload Scope
+
+```http
+POST https://api.monadix.ai/uploads/scopes
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
+```
+
+Empty body. Returns:
+
+```json
+{
+  "scopeId": "usc_AbCdEf0123456789Gh",
+  "limits": { "maxFileSizeBytes": 26214400 }
+}
+```
+
+Mint **once per task**. Reuse the same `scopeId` for every file that belongs
+to the same delegation; mint a fresh one for each independent task.
+
+#### Upload File (multipart — different HMAC payload!)
+
+```http
+POST https://api.monadix.ai/uploads/scopes/<scopeId>/files
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.POST:/uploads/scopes/<scopeId>/files")>
+Content-Type: multipart/form-data; boundary=...
+
+--...
+Content-Disposition: form-data; name="file"; filename="contract.pdf"
+Content-Type: application/pdf
+
+<file bytes>
+--...--
+```
+
+**The signed payload for this endpoint alone is `"<timestamp>.<METHOD>:<path>"`
+— the request body is NOT included in the signature.** TLS guarantees
+transport integrity; this scheme avoids having to buffer multi-megabyte
+bodies just to compute their MAC.
+
+Response:
+
+```json
+{
+  "file": {
+    "fileId": "upl_AbCdEf0123456789Gh",
+    "url": "https://<project>.supabase.co/storage/v1/object/public/monadix-uploads/tasks/usc_.../upl_.../contract.pdf",
+    "storagePath": "tasks/usc_.../upl_.../contract.pdf",
+    "originalName": "contract.pdf",
+    "contentType": "application/pdf",
+    "sizeBytes": 184321,
+    "sha256Hex": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+  }
+}
+```
+
+The `url` is publicly readable with no auth — paste it into the publish
+description or `input` payload so the provider can fetch it.
+
+**Error responses:**
+
+- `400 Bad Request` — missing `file` part, empty file, file > 25 MiB, blocked
+  filename extension, or malformed multipart body. Surface the message
+  verbatim and adjust the upload.
+- `401 Unauthorized` — see the Authentication section. Note the
+  method-path payload format above; signing the body by mistake will
+  produce `bad-signature` here.
+
+#### List Files in a Scope
+
+```http
+GET https://api.monadix.ai/uploads/scopes/<scopeId>/files
+Authorization: Bearer <monadix.key contents>
+X-Monadix-Timestamp: <unix-ms>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
+```
+
+Returns `{ "files": UploadedFile[] }`. Useful for recovering URLs the agent
+already minted (e.g. after a process restart) without re-uploading.
+
+---
+
+
 
 Submit a 1–5 star rating for a completed task you previously created. Ratings are
 immutable: once a task has been rated, further attempts return `409 Conflict`.

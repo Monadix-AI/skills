@@ -267,6 +267,92 @@ async function closeConversation(taskId, reason) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Uploads primitives (file attachments)
+// ---------------------------------------------------------------------------
+//
+// Use BEFORE Step 3a (Reserve a Conversation ID) whenever the task involves
+// real files (binaries, PDFs, images, large text). Mint one scope per task,
+// upload each file, then paste the returned public URLs into the publish
+// description or `input` payload — never paste the `scopeId` itself, it is a
+// capability.
+
+/**
+ * Mint a fresh upload scope. Returns `{ scopeId, limits }`.
+ * The `scopeId` is an unguessable capability — keep it private to the consumer.
+ *
+ * @returns {Promise<{ scopeId: string, limits: { maxFileSizeBytes: number } }>}
+ */
+async function createUploadScope() {
+  return callMonadix('/uploads/scopes', {});
+}
+
+/**
+ * Upload a single file to a scope.
+ *
+ * NOTE: HMAC signing for the upload endpoint signs `<timestamp>.<METHOD>:<path>`
+ * (method-path mode) — NOT the multipart body. This is the only endpoint in
+ * the Monadix API that signs that way; every other endpoint signs the raw body.
+ *
+ * @param {string} scopeId       - scope id returned by createUploadScope()
+ * @param {string} localFilePath - absolute or relative path to a file on disk
+ * @param {object} [opts]
+ * @param {string} [opts.filename]    - override the upload filename (defaults to basename of localFilePath)
+ * @param {string} [opts.contentType] - override the multipart Content-Type (defaults to application/octet-stream)
+ * @returns {Promise<{ file: { fileId: string, url: string, storagePath: string, originalName: string, contentType: string, sizeBytes: number, sha256Hex: string } }>}
+ */
+async function uploadFile(scopeId, localFilePath, opts) {
+  opts = opts || {};
+  var apiKey = loadKey('monadix.key');
+  var signingKey = loadKey('monadix.signing-key');
+
+  var bytes = fs.readFileSync(localFilePath);
+  var filename = opts.filename || path.basename(localFilePath);
+  var contentType = opts.contentType || 'application/octet-stream';
+
+  // FormData is global in Node.js 18+.
+  var form = new FormData();
+  form.append('file', new Blob([bytes], { type: contentType }), filename);
+
+  var apiPath = '/uploads/scopes/' + encodeURIComponent(scopeId) + '/files';
+  var timestamp = Date.now().toString();
+  // Method-path HMAC mode: payload is `<timestamp>.<METHOD>:<path>`. Body bytes are NOT signed.
+  var signature = crypto.createHmac('sha256', signingKey)
+    .update(timestamp + '.POST:' + apiPath)
+    .digest('hex');
+
+  var res = await fetch('https://api.monadix.ai' + apiPath, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'X-Monadix-Timestamp': timestamp,
+      'X-Monadix-Signature': signature,
+    },
+    body: form,
+  });
+  var text = await res.text();
+  var parsed;
+  try { parsed = text ? JSON.parse(text) : null; } catch (_) { parsed = null; }
+  if (!res.ok) {
+    var err = new Error('Monadix upload error: ' + res.status + ' ' + text);
+    err.status = res.status;
+    err.body = parsed;
+    throw err;
+  }
+  return parsed;
+}
+
+/**
+ * List the files already uploaded into a scope. Useful for recovering URLs
+ * after a process restart without re-uploading.
+ *
+ * @param {string} scopeId
+ * @returns {Promise<{ files: Array<object> }>}
+ */
+async function listScopeFiles(scopeId) {
+  return getMonadix('/uploads/scopes/' + encodeURIComponent(scopeId) + '/files');
+}
+
 /**
  * Full delegation workflow (step-by-step — pauses at each boundary):
  *   Step 1 — Match:        call the match API, print ranked providers
@@ -421,6 +507,9 @@ module.exports = {
   respondToProvider: respondToProvider,
   closeConversation: closeConversation,
   rateTask: rateTask,
+  createUploadScope: createUploadScope,
+  uploadFile: uploadFile,
+  listScopeFiles: listScopeFiles,
 };
 
 // Example invocation (runs when executed directly)

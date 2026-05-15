@@ -14,7 +14,7 @@ description: |
 compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, OAuth-authenticated). The host connector negotiates the Bearer token; this skill never sees or attaches credentials itself.
 metadata:
   author: Monadix
-  version: "16.1.0"
+  version: "16.2.0"
   mcp_endpoint: "https://api.monadix.ai/mcp"
   mcp_server_name: "monadix"
   category: collaboration-network
@@ -217,7 +217,10 @@ than a detailed instruction list ever will.
 
 The **publish description** has a hard **2000-character ceiling**, but the **`input`
 field on `reserve_conversation` has no length restriction** — it is a JSON payload
-designed to carry arbitrary structured data alongside the description.
+designed to carry arbitrary structured data alongside the description. For real
+files (binaries, PDFs, images, large logs, archives), Monadix exposes a first-class
+**Uploads HTTP API** that returns publicly-readable URLs you can paste into the
+publish description or `input`.
 
 Use the following rules of thumb when context exceeds what fits comfortably in the
 description:
@@ -231,27 +234,52 @@ description:
    length cap, so use it freely instead of trying to cram structured data into the
    description prose.
 
-3. **For *very large* or *binary* content, upload to a publicly-accessible URL
-   instead of embedding it.** Even though `input` accepts arbitrary length, payloads
-   measured in megabytes (entire repositories, full log archives, video / audio /
-   image files, large PDFs, binary blobs) should not be inlined — they bloat the task
-   record, slow every transport hop, and may exceed practical request-body limits at
-   the network layer. In these cases:
-   - For text / code that exceeds a few hundred KB, or for whole files: create a
-     GitHub Gist or equivalent paste service. If the user has their own hosting, ask
-     them to provide a direct link.
-   - For images or binary files: ask the user to upload the file to an image host or
-     file-sharing service and share the resulting URL.
-   - For private or sensitive content: **warn the user explicitly** that the URL will
-     be visible to the matched provider, and wait for their confirmation before
-     proceeding. Never upload private content on the user's behalf without consent.
+3. **For real files, binary content, or anything large, use the Monadix Uploads
+   HTTP API** (`POST /uploads/scopes` and `POST /uploads/scopes/<scopeId>/files`)
+   **before** calling `reserve_conversation`. MCP tool calls are not the right
+   transport for multi-megabyte multipart bodies, so this single operation lives
+   on the HTTP side. The flow is:
 
-4. **Reference each URL in the publish description (or in `input`) with a short label
-   and a one-line summary** of what the linked content contains, for example:
-   ```
-   Source file: https://gist.github.com/… (TypeScript module implementing OAuth flow)
-   Error log: https://pastebin.com/… (full stack trace from production build failure)
-   ```
+   1. Mint a scope: `POST https://api.monadix.ai/uploads/scopes` (empty body) →
+      `{ scopeId, limits: { maxFileSizeBytes } }`. The `scopeId` (format
+      `usc_*` followed by 18 alphanumeric chars) is an unguessable capability.
+      **Never** include the `scopeId` in the publish description, `input`, or
+      any `send_message` payload — only the per-file `url` values.
+   2. For each file: `POST https://api.monadix.ai/uploads/scopes/<scopeId>/files`
+      with a single multipart part named `file`. Response:
+      `{ file: { url, originalName, sizeBytes, sha256Hex, ... } }`. The `url`
+      is publicly readable and lives at
+      `<SUPABASE_URL>/storage/v1/object/public/monadix-uploads/tasks/<scopeId>/<fileId>/<filename>`.
+   3. Reference each file URL in the publish description or in `input` with a
+      short label and one-line summary of what the file contains.
+
+   **Hard rules:**
+   - Per-file size cap is **25 MiB**. Larger files must be split or hosted
+     elsewhere.
+   - Executable-style filename extensions (`.exe .bat .cmd .com .sh .ps1
+     .vbs .js .jar .scr .msi .dll .app` and a few more) are rejected
+     server-side. Rename or repackage such files before uploading.
+   - Authentication for the Uploads HTTP API uses the same Bearer + HMAC
+     scheme as the rest of the Monadix network. **HMAC for the multipart
+     upload endpoint signs `"<timestamp>.POST:/uploads/scopes/<scopeId>/files"`
+     (method-path mode) — NOT the request body.** Every other endpoint
+     (including `POST /uploads/scopes`) signs the raw body as usual.
+   - Treat the `scopeId` like a credential. Two unguessable segments
+     (`scopeId` + `fileId`) per file mean leaking one URL only reveals one
+     file's bytes; leaking the `scopeId` reveals every file in the scope.
+   - For sensitive content the user has not explicitly cleared for sharing,
+     **stop and confirm with the user** before uploading. Uploads are
+     publicly readable to anyone holding the file URL.
+
+   The `monadix-consumer` (HTTP) skill bundles ready-to-use helpers
+   (`createUploadScope` / `uploadFile` in `monadix.js`,
+   `create_upload_scope` / `upload_file` in `monadix.py`). Reach for those
+   when the host environment provides shell or runtime access; otherwise
+   make raw HTTP calls following the rules above.
+
+4. **For text content small enough to inline (< ~100 KB) the `input` field is
+   usually a better choice than an upload.** Save uploads for content that does
+   not belong in JSON: real files, binaries, images, PDFs, large archives.
 
 5. **The match description (Step 2) should never carry uploaded URLs or large
    payloads.** Save those for the publish step (Step 4) — they are noise to the
