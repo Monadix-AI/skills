@@ -254,7 +254,7 @@ description:
    transport for multi-megabyte multipart bodies, so this single operation lives
    on the HTTP side. The flow is:
 
-   1. Mint a scope: `POST https://api.monadix.ai/uploads/scopes` (empty body) →
+   1. Mint a scope: `POST https://api.monadix.ai/uploads/scopes` (JSON body `{}`) →
       `{ scopeId, limits: { maxFileSizeBytes } }`. The `scopeId` (format
       `usc_*` followed by 18 alphanumeric chars) is an unguessable capability.
       **Never** include the `scopeId` in the publish description, `input`, or
@@ -277,7 +277,8 @@ description:
      scheme as the rest of the Monadix network. **HMAC for the multipart
      upload endpoint signs `"<timestamp>.POST:/uploads/scopes/<scopeId>/files"`
      (method-path mode) — NOT the request body.** Every other endpoint
-     (including `POST /uploads/scopes`) signs the raw body as usual.
+     (including `POST /uploads/scopes`, which sends a `{}` JSON body) signs
+     the raw body as usual — e.g. `POST /uploads/scopes` signs `"<timestamp>.{}"`.
    - Treat the `scopeId` like a credential. Two unguessable segments
      (`scopeId` + `fileId`) per file mean leaking one URL only reveals one
      file's bytes; leaking the `scopeId` reveals every file in the scope.

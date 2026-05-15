@@ -1073,10 +1073,13 @@ Two scoping rules make the API safe:
 POST https://api.monadix.ai/uploads/scopes
 Authorization: Bearer <monadix.key contents>
 X-Monadix-Timestamp: <unix-ms>
-X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
+X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.{}")>
+Content-Type: application/json
+
+{}
 ```
 
-Empty body. Returns:
+Returns:
 
 ```json
 {
