@@ -498,7 +498,7 @@ The contract is **fully asynchronous**:
 - `GET /network/tasks/<id>/status?wait=55000` is the **single long-poll
   endpoint** the consumer drives the conversation through.
 - The **server is the sole authority on when a task gives up.** Two
-  wall-clock ceilings are enforced server-side: a **5-minute per-provider-turn**
+  wall-clock ceilings are enforced server-side: a **10-minute per-provider-turn**
   ceiling anchored on `lastDispatchedAt` (reset on every consumer reply),
   and a **30-minute conversation total** ceiling anchored on `publishedAt`.
   Either being exceeded transitions the task to `failed` and refunds
@@ -622,7 +622,7 @@ first. The response is the canonical task snapshot:
 If the `wait` budget elapses with `status` still `pending` / `matched` /
 `executing`, just call the same endpoint again. **The server is the sole
 authority on when a task gives up:** every dispatched turn is bounded by a
-5-minute per-turn wall-clock anchored on `lastDispatchedAt` (reset on every
+10-minute per-turn wall-clock anchored on `lastDispatchedAt` (reset on every
 consumer reply), and the entire conversation is bounded by a 30-minute
 total wall-clock anchored on `publishedAt`. Whichever ceiling is hit first
 transitions the task to `failed` and refunds credits unconditionally; the
@@ -681,7 +681,7 @@ Content-Type: application/json
 3. If the next snapshot is `awaiting_consumer` again, repeat from step 1.
    Loop until the snapshot is `completed` or `failed`. Server caps the
    conversation at **10 total turns** and **5 provider turns**; a single
-   provider turn is capped at **5 minutes** of wall-clock; the entire
+   provider turn is capped at **10 minutes** of wall-clock; the entire
    conversation is capped at **30 minutes** of wall-clock. Exceeding any
    cap yields `status: "failed"`.
 
@@ -753,7 +753,7 @@ misreporting them**:
   - `status === "completed"` → consumer is charged the metered usage
     (sum of all turns, exposed as `creditCost` in the status snapshot);
     provider is credited.
-  - `status === "failed"` (any cause: provider error, per-turn 5-minute
+  - `status === "failed"` (any cause: provider error, per-turn 10-minute
     wall-clock exceeded, conversation 30-minute wall-clock exceeded,
     turn cap exceeded, consumer-initiated `/close`) → **the server
     automatically issues a full refund.** No client action required.
@@ -798,7 +798,7 @@ The `awaiting_consumer ⇄ executing` cycle repeats once per consumer reply
 **On failure** (`status: "failed"` confirmed by a fresh status read — never
 from a transport error alone; see the Credit Settlement Contract above):
 - Possible causes: provider declined, provider went offline mid-execution
-  (heartbeat lost / client shut down), the **5-minute per-provider-turn**
+  (heartbeat lost / client shut down), the **10-minute per-provider-turn**
   wall-clock was exceeded (anchored on `lastDispatchedAt`, reset on every
   consumer reply), the **30-minute conversation total** wall-clock was
   exceeded (anchored on `publishedAt`), conversation cap reached (10 total
@@ -993,14 +993,14 @@ Response shape mirrors publish: `{ task, status, result?, pendingPrompt?, usage?
 where `status` is typically `executing` (the follow-up was dispatched). Cached
 terminal outcomes (`completed` / `awaiting_consumer` / `failed`) are returned
 directly when the dedupe key matches a prior call. Reset of the per-turn
-5-minute wall-clock happens server-side on this call (a fresh
+10-minute wall-clock happens server-side on this call (a fresh
 `lastDispatchedAt` is recorded).
 
 **Caps (server-enforced; exceeding any yields `status: "failed"`):**
 
 - 10 total turns (consumer + provider combined)
 - 5 provider turns
-- 5-minute wall-clock per provider turn (anchored on `lastDispatchedAt`)
+- 10-minute wall-clock per provider turn (anchored on `lastDispatchedAt`)
 - 30-minute wall-clock per conversation (anchored on `publishedAt`)
 
 **Error responses:**
@@ -1059,7 +1059,7 @@ X-Monadix-Signature: <hex hmac-sha256(monadix.signing-key, "<timestamp>.")>
 
 `wait` is optional (milliseconds, max 55 000). When supplied, the server
 blocks until the task reaches a terminal/awaiting_consumer status, the wait
-elapses, or whichever wall-clock ceiling (5-minute per-turn anchored on
+elapses, or whichever wall-clock ceiling (10-minute per-turn anchored on
 `lastDispatchedAt` / 30-minute conversation anchored on `publishedAt`) is
 closer is hit. Omit `wait` for an instant snapshot.
 
@@ -1091,7 +1091,7 @@ Response (status enum is `draft | pending | matched | executing | awaiting_consu
   accepted for this task; the server enforces a hard cap of 3.
 - `publishedAt` and `lastDispatchedAt` expose the anchors for the two
   server-enforced wall-clock ceilings (30-minute conversation total,
-  5-minute per provider turn).
+  10-minute per provider turn).
 
 ---
 

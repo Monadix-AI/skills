@@ -143,7 +143,7 @@ The contract is **fully asynchronous**:
   `result` (when `completed`) and `pendingPrompt` (when `awaiting_consumer`),
   so no separate fetch is needed to advance the conversation.
 - The **server is the sole authority on when a task gives up.** Two
-  wall-clock ceilings are enforced server-side: a **5-minute per-provider-turn**
+  wall-clock ceilings are enforced server-side: a **10-minute per-provider-turn**
   ceiling anchored on `lastDispatchedAt` (reset on every consumer reply),
   and a **30-minute conversation total** ceiling anchored on `publishedAt`.
   Either being exceeded transitions the task to `failed` and refunds
@@ -534,7 +534,7 @@ The server blocks until the task reaches `completed` / `failed` /
 `awaiting_consumer`, the wait elapses, or whichever wall-clock ceiling
 is closer is hit. Loop calling this with `waitMs: 55000` until `status`
 is terminal/awaiting_consumer — the server will eventually settle every
-task within the 5-min per-turn / 30-min conversation ceilings, so this
+task within the 10-min per-turn / 30-min conversation ceilings, so this
 loop is bounded.
 
 The snapshot already carries everything needed:
@@ -584,7 +584,7 @@ loop; do not re-match, re-reserve, or re-publish.**
      prior outcome instead of inserting a second consumer turn or
      re-dispatching the provider).
 3. The response shape mirrors `publish_conversation`: typically `executing`
-   (the follow-up was dispatched). The per-turn 5-minute wall-clock is
+   (the follow-up was dispatched). The per-turn 10-minute wall-clock is
    reset server-side on this call.
 4. Resume Step 5b — long-poll `get_task_status` with `waitMs: 55000` until
    the next terminal/awaiting_consumer snapshot. If that snapshot is again
@@ -593,7 +593,7 @@ loop; do not re-match, re-reserve, or re-publish.**
    with a full refund:
    - 10 total turns (consumer + provider combined)
    - 5 provider turns
-   - **5-minute per-provider-turn wall-clock** (anchored on `lastDispatchedAt`)
+   - **10-minute per-provider-turn wall-clock** (anchored on `lastDispatchedAt`)
    - **30-minute conversation total wall-clock** (anchored on `publishedAt`)
 
 #### Step 5d — Close (optional consumer-side abort)
@@ -623,7 +623,7 @@ tool-timeout. The cardinal rule:
 - The agent MUST NOT report "task failed" / "task timed out" based on
   a transport failure alone. It MUST first read the canonical status
   via a successful `get_task_status` call.
-- The two server-enforced wall-clock ceilings (**5-minute per-provider-turn**
+- The two server-enforced wall-clock ceilings (**10-minute per-provider-turn**
   on `lastDispatchedAt` and **30-minute conversation total** on
   `publishedAt`) guarantee every task settles eventually. The agent does
   not need a client-side recovery deadline.
@@ -664,7 +664,7 @@ misreporting them**:
   - `status === "completed"` → consumer is charged the metered usage
     (sum of all turns); provider is credited.
   - `status === "failed"` (any cause: provider error, server-enforced
-    5-min per-turn or 30-min conversation ceiling, conversation cap
+    10-min per-turn or 30-min conversation ceiling, conversation cap
     exceeded, consumer-initiated `close_conversation`) → **the server
     automatically issues a full refund.** No client action is required.
 - Read `creditCost` from a `get_task_status` snapshot whose `status` is
@@ -704,7 +704,7 @@ until the provider terminates the conversation.
 read — never from a transport error alone; see "What a transport failure
 means" above):
 - Possible causes: provider declined, provider went offline mid-execution
-  (heartbeat lost / client shut down), the **5-minute per-provider-turn**
+  (heartbeat lost / client shut down), the **10-minute per-provider-turn**
   wall-clock was exceeded (anchored on `lastDispatchedAt`, reset on every
   consumer reply), the **30-minute conversation total** wall-clock was
   exceeded (anchored on `publishedAt`), conversation cap reached (10 total
@@ -856,7 +856,7 @@ Reply to a provider `awaiting_consumer` prompt. Persists the consumer turn
 (idempotent via `clientTurnId`), broadcasts the follow-up to the provider,
 and returns immediately. **Does NOT wait for the provider's next turn** —
 long-poll `get_task_status` to drive the conversation forward. Resets the
-per-turn 5-minute wall-clock server-side (fresh `lastDispatchedAt`).
+per-turn 10-minute wall-clock server-side (fresh `lastDispatchedAt`).
 
 Input:
 
@@ -883,7 +883,7 @@ directly when the dedupe key matches a prior call.
 
 - 10 total turns (consumer + provider combined)
 - 5 provider turns
-- **5-minute wall-clock per provider turn** (anchored on `lastDispatchedAt`)
+- **10-minute wall-clock per provider turn** (anchored on `lastDispatchedAt`)
 - **30-minute wall-clock per conversation** (anchored on `publishedAt`)
 
 Error responses (returned as `isError: true`):
@@ -943,7 +943,7 @@ Input:
 
 `waitMs` is optional (max 55000). When supplied, the server blocks until
 the task reaches a terminal/awaiting_consumer status, the wait elapses,
-or whichever wall-clock ceiling (5-min per-turn anchored on
+or whichever wall-clock ceiling (10-min per-turn anchored on
 `lastDispatchedAt` / 30-min conversation anchored on `publishedAt`) is
 closer is hit. Omit `waitMs` for an instant snapshot.
 

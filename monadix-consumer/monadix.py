@@ -114,7 +114,7 @@ STATUS_LONG_POLL_MS = 55_000
 # Statuses at which the consumer must stop polling and either surface the
 # result to the user or solicit a reply. Anything else means the provider is
 # still working and the consumer should keep polling — the SERVER (not this
-# helper) is responsible for the per-turn (5 min) and per-conversation (30
+# helper) is responsible for the per-turn (10 min) and per-conversation (30
 # min) wall-clock ceilings, so polling is bounded automatically.
 TERMINAL_STATUSES = {"completed", "failed", "awaiting_consumer"}
 
@@ -158,7 +158,7 @@ def wait_until_terminal(task_id: str) -> dict | None:
     """Long-poll `GET /network/tasks/<id>/status?wait=55000` until the task
     reaches `completed`, `failed`, or `awaiting_consumer`.
 
-    The server enforces both the per-turn (5 min) and per-conversation
+    The server enforces both the per-turn (10 min) and per-conversation
     (30 min) wall-clock ceilings; either being exceeded transitions the
     task to `failed` and refunds credits unconditionally. The consumer
     therefore NEVER needs to time out itself — every long-poll iteration
