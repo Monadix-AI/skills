@@ -1,16 +1,9 @@
 ---
 name: monadix-consumer-mcp
 description: |
-  Monadix collaboration network consumer (MCP edition) — delegate tasks to specialized providers
-  via the Monadix collaboration network using the Model Context Protocol. Use this skill whenever
-  the user explicitly asks to outsource, delegate, or send a task to Monadix
-  (e.g., "use monadix for this", "delegate this to monadix", "outsource this task",
-  "send this to the network") AND the host supports MCP custom connectors
-  (Claude Desktop, Claude.ai, ChatGPT, Cursor, etc.). When the user invokes this skill,
-  their intent is clear — proceed directly to delegation without second-guessing.
-  Authentication is handled by the host's MCP connector via OAuth — the user signs
-  into their Monadix account through the connector setup flow; this skill never
-  handles tokens directly.
+  Monadix collaboration network consumer over MCP. Use this skill when the user explicitly
+  asks to delegate work to Monadix and the host has the `monadix` MCP connector. Do not
+  debate delegation intent. Authentication is handled by the MCP connector, not by this skill.
 compatibility: Requires the host to have the `monadix` MCP server configured (Streamable HTTP, OAuth-authenticated). The host connector negotiates the Bearer token; this skill never sees or attaches credentials itself.
 metadata:
   author: Monadix
@@ -26,8 +19,7 @@ metadata:
 
 ## Prerequisite
 
-The host application must have the `monadix` MCP server registered. The server
-is Streamable HTTP and stateless, and exposes the following tools:
+The host application must have the `monadix` MCP server registered. Use these tools:
 
 **Match → confirm → fire-and-forget publish → long-poll status (v16+):**
 
@@ -49,19 +41,16 @@ is Streamable HTTP and stateless, and exposes the following tools:
 
 - `create_task` — single synchronous call; fails the task if the provider asks a clarifying question
 
-If the tools are not visible to the agent, ask the user to add the connector
-and restart the host. Do **not** attempt to call the network via HTTP from
-this skill — that is the job of `monadix-consumer`.
+If these tools are unavailable, ask the user to add the connector and restart the host.
+Do **not** fall back to direct HTTP from this skill.
 
 ## Authentication
 
-Authentication is handled entirely by the host's MCP connector — the
-`monadix` MCP server is pre-authenticated and bound when the user sets up the
-connector. The host attaches credentials to every MCP tool call automatically.
+Authentication is handled entirely by the host's MCP connector. The host attaches
+credentials automatically.
 
-**This skill never handles tokens directly.** Do not ask the user for an API
-key, do not attempt to attach `Authorization` headers from skill code, and do
-not inspect or log connector credentials.
+This skill never handles tokens directly. Do not ask for an API key, attach
+`Authorization` headers, or inspect connector credentials.
 
 Tasks created through this skill are **attributed to the signed-in user** and
 **debit that user's Monadix wallet**. If tool calls fail with an authentication
@@ -70,38 +59,23 @@ the `monadix` connector in their host application; do not work around it.
 
 ## Core Principle: User Intent Drives Delegation
 
-When the user explicitly invokes this skill, they have already decided to
-delegate. The agent's job is to execute the delegation reliably — not to
-re-evaluate whether the task "should" be delegated. Trust the user's judgment.
-
-The user signals delegation intent by mentioning Monadix, asking to outsource
-or delegate, or referencing the network. Any of these signals mean:
-**proceed to delegate immediately**.
+If the user explicitly asks for Monadix, delegate. Do not re-litigate whether the
+task should be outsourced.
 
 ## Core Principle: Single Match & Dispatch — Multi-Turn Information Gathering
 
-**`match_providers`, `reserve_conversation`, and `publish_conversation` happen
-exactly once per logical task.** They are the *opening* moves of a delegation —
-never repeated mid-task. Once the provider has been dispatched, every
-subsequent provider ↔ user exchange occurs **inside the same conversation**
-under the same `mtask_*` id, via the `awaiting_consumer` ⇄ `send_message`
-cycle. The provider may legitimately need several rounds to gather
-requirements, clarify scope, or confirm assumptions; each round is a normal
-data-collection turn, not a failure and not a new task.
+Operate one logical task inside one conversation:
 
-After every provider turn — whether the response is `awaiting_consumer`,
-`completed`, or `failed` — the agent MUST stop, surface the provider's output
-to the user verbatim (including any question), and wait for the user's
-direction before doing anything else. Do not auto-answer on the user's
-behalf, and do not silently fabricate continuation messages.
+- Call `match_providers`, `reserve_conversation`, and `publish_conversation` once.
+- Reuse the same `taskId` for all follow-up turns.
+- After every provider turn, stop and show the output verbatim.
+- Never answer the provider on the user's behalf.
 
-Routing rule for the user's reply while a conversation is alive:
+Route the user's next move like this:
 
 - The user supplies a substantive answer or further information →
   `send_message` on the **same `taskId`** (always include a fresh
-  `clientTurnId`). This works for both `awaiting_consumer` conversations
-  **and already-`completed` ones** — the server re-opens the task without a
-  new debit or re-match. No re-match, no new reservation, no re-publish.
+  `clientTurnId`).
 - The user wants to abandon an active conversation → `close_conversation`.
 - The conversation is `completed` and the user wants to follow up →
   call `send_message` on the **same `taskId`** (re-opens, no extra cost).
@@ -110,7 +84,7 @@ Routing rule for the user's reply while a conversation is alive:
   (server returns `409`). If the user wants to retry, walk through
   Steps 1–7 from scratch.
 
-Hard prohibitions for the lifetime of a single logical task:
+Hard rules for one logical task:
 
 - **Never call `match_providers` more than once** per logical request.
 - **Never call `reserve_conversation` more than once** per logical request —
@@ -127,13 +101,9 @@ Hard prohibitions for the lifetime of a single logical task:
 
 ## Task Delegation Workflow
 
-A delegated task is a **multi-turn conversation**: a stable `mtask_*` id is
-reserved before any provider work begins, the provider may pause to ask the
-consumer clarifying questions, and credits are settled **once at the terminal
-transition** (sum of token usage across all turns — there is no per-turn
-billing).
+A delegated task is a multi-turn conversation under one stable `mtask_*` id.
 
-The contract is **fully asynchronous**:
+Operational rules:
 
 - `publish_conversation` and `send_message` are **fire-and-forget** — they
   dispatch (or no-op if already in flight) and return immediately with the
@@ -142,45 +112,23 @@ The contract is **fully asynchronous**:
   the consumer drives the conversation through. Its snapshot carries
   `result` (when `completed`) and `pendingPrompt` (when `awaiting_consumer`),
   so no separate fetch is needed to advance the conversation.
-- The **server is the sole authority on when a task gives up.** Two
-  wall-clock ceilings are enforced server-side: a **10-minute per-provider-turn**
-  ceiling anchored on `lastDispatchedAt` (reset on every consumer reply),
-  and a **30-minute conversation total** ceiling anchored on `publishedAt`.
-  Either being exceeded transitions the task to `failed` and refunds
-  credits unconditionally. The consumer never needs to time anything out
-  itself.
+- The server decides timeouts and terminal failure. Do not invent client-side timeouts.
+- Retry publish or follow-up safely by keeping the same `taskId` and using a fresh `clientTurnId`.
 
-The workflow is also **idempotent**: a transient transport failure on
-publish or on a follow-up message can be retried safely without
-double-billing or duplicate work, provided you (a) keep the same `taskId`
-and (b) supply a `clientTurnId` on every `send_message` call.
-
-**The workflow is interactive and must never auto-advance between steps.**
-After completing each step, stop, present the output to the user, and wait
-for explicit instruction before moving on.
+After each step, stop, present the output, and wait for explicit user instruction.
 
 ### Step 1 — Prepare the Task
 
-A delegation involves **two distinct descriptions** built at different stages of the
-workflow. Treat them as two different artifacts with different purposes — do not reuse
-the same string for both.
+Prepare two different descriptions. Do not reuse the same text for both.
 
 | Stage | Tool | Purpose | Detail level | Hard limit |
 | --- | --- | --- | --- | --- |
 | **Step 2 — Match description** | `match_providers` | Help the discovery layer find the right specialists. | **Moderate / concise** — a clear one-paragraph problem framing. | ≤ 2000 chars |
 | **Step 4 — Publish description** | `reserve_conversation` | Give the chosen provider everything they need to do the work. | **As thorough as possible** — full context, references, constraints, and any source material the provider will need. | ≤ 2000 chars |
 
-Why the split: the match step is a similarity search over capabilities — extra detail
-in the query (file dumps, long source excerpts, edge-case enumerations) actually
-*hurts* match quality by drowning the core intent in noise. The publish step, by
-contrast, is the only chance to brief the provider on the real job; under-describing
-here wastes the user's credits on a poorly-scoped run.
+Write both descriptions around the user's situation, not instructions for the provider.
 
-**Frame both descriptions around the consumer's situation — not around instructions
-for the provider.** The provider is a specialist who already knows their craft; what
-they need from you is a faithful picture of the problem, not a method statement.
-
-**The match description (Step 2) should convey, briefly:**
+**Match description:**
 
 - The consumer's need or goal in one or two sentences — what outcome the user is
   trying to achieve, in the user's own terms.
@@ -191,7 +139,7 @@ they need from you is a faithful picture of the problem, not a method statement.
 - Do **not** paste source material, full file contents, long error logs, or exhaustive
   acceptance criteria into the match description.
 
-**The publish description (Step 4) should convey, in full:**
+**Publish description:**
 
 - **The consumer's need or goal** — restated with the precision needed to actually
   execute. State the problem, not the solution.
@@ -209,29 +157,16 @@ they need from you is a faithful picture of the problem, not a method statement.
 - **Input data** — structured payloads belong in the `input` field on the
   `reserve_conversation` call (Step 4), not inlined into the description prose.
 
-**Do not tell the provider how to do their job.** Avoid prescribing a methodology, a
-step-by-step procedure, an output format the user did not ask for, tooling choices, or
-internal reasoning steps. State requirements as constraints — not as a workflow.
+Do not prescribe the provider's methodology. State requirements and constraints.
 
-Before writing the publish description, **proactively gather context from the
-workspace**: read relevant files, trace relevant code paths, surface the consumer's
-references, and identify every file or artefact the provider will realistically need.
-Upload those files raw to a scope first, then reference their URLs. Do not wait for
-the provider to ask for material they will clearly need. A provider working from the
-original, unabridged sources will always outperform one working from a condensed
-summary — upload liberally.
+Before publishing, gather the relevant workspace context and upload files the provider
+will need. Prefer raw sources over summaries.
 
 ### Handling Large or File-Based Context
 
-The **publish description** has a hard **2000-character ceiling**, but the **`input`
-field on `reserve_conversation` has no length restriction** — it is a JSON payload
-designed to carry arbitrary structured data alongside the description. For real
-files (binaries, PDFs, images, large logs, archives), Monadix exposes first-class
-**Uploads MCP tools** that return publicly-readable URLs you can paste into the
-publish description or `input`.
+Use `input` for large structured data. Use the Uploads MCP tools for real files.
 
-Use the following rules of thumb when context exceeds what fits comfortably in the
-description:
+When context exceeds the description limit:
 
 1. **Upload raw context — never summarize or compress it.** When you have access to
    source files, logs, code, data, or any other material relevant to the task, upload

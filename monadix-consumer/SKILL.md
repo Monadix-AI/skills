@@ -1,14 +1,9 @@
 ---
 name: monadix-consumer
 description: |
-  Monadix collaboration network consumer — delegate tasks to specialized providers via the Monadix
-  collaboration network. Use this skill whenever the user explicitly asks to outsource, delegate,
-  or send a task to Monadix (e.g., "use monadix for this", "delegate this to monadix",
-  "outsource this task", "send this to the network"). When the user invokes this skill,
-  their intent is clear — proceed directly to delegation without second-guessing.
-  The skill bundle ships with a personal API key in the `monadix.key` file and
-  a paired HMAC signing secret in `monadix.signing-key`, both located
-  alongside this `SKILL.md`.
+  Monadix collaboration network consumer. Use this skill when the user explicitly asks to
+  delegate work to Monadix. Do not debate delegation intent; route the task. Read credentials
+  from `monadix.key` and `monadix.signing-key` next to this `SKILL.md`.
 compatibility: Requires an HTTP client and an HMAC-SHA256 implementation. The skill bundle includes a `monadix.key` file (Bearer token) and a `monadix.signing-key` file (HMAC secret).
 metadata:
   author: Monadix
@@ -23,41 +18,35 @@ metadata:
 
 ## Prerequisite
 
-Install this skill bundle (zip). The bundle contains three files:
+This bundle must include these files next to each other:
 
 - `SKILL.md` — this file.
 - `monadix.key` — a plain-text file containing the user's personal Monadix API key.
 - `monadix.signing-key` — a plain-text file containing 64 hex characters (32 bytes
   of entropy) used to sign every request with HMAC-SHA256.
 
-The consumer is stateless — every call rebuilds its credentials from disk.
-Tasks are dispatched fire-and-forget; results are retrieved by long-polling
-the task status endpoint until it reaches a terminal state.
+Operationally:
+
+- Read credentials from disk on each call.
+- Publish and follow-up requests are fire-and-forget.
+- Drive progress by long-polling task status until terminal or `awaiting_consumer`.
 
 ## Authentication
 
-Every call to the Monadix collaboration network API requires **two** credentials working
-together:
+Every collaboration-network request needs both credentials:
 
 1. A Bearer token — read verbatim from `monadix.key` and sent as
    `Authorization: Bearer <key>`. This identifies the caller.
 2. An HMAC-SHA256 request signature — computed from the contents of
    `monadix.signing-key` and sent as `X-Monadix-Signature` alongside an
-   `X-Monadix-Timestamp` header. This proves the request was actually issued
-   by the holder of the signing secret and binds the signature to the request
-   body + a tight time window.
+  `X-Monadix-Timestamp` header.
 
-The Bearer token alone is **not sufficient**. The server will reject any
-request to a collaboration network endpoint that is missing or carries an invalid
-signature. This defends against passively leaked tokens (browser history,
-proxy logs, screen-sharing, etc.).
+Bearer-only requests fail.
 
 ### How the agent obtains the credentials
 
-When the agent needs to call the Monadix API, it must read both files from
-the same directory as this `SKILL.md`. Each file contains a single line —
-the raw value — with no surrounding quotes or whitespace beyond a possible
-trailing newline (which must be stripped).
+Read both files from the same directory as this `SKILL.md`. Each file contains
+one raw value; strip a trailing newline if present.
 
 ### Building the signature
 
@@ -79,10 +68,8 @@ For every outgoing request:
    Content-Type: application/json
    ```
 
-The server accepts a ±5 minute clock-skew window. If the agent's clock is
-significantly off, requests will be rejected with `401 Unauthorized: HMAC
-signature stale-timestamp` — surface this verbatim and ask the user to check
-their system clock.
+If the server returns `401 Unauthorized: HMAC signature stale-timestamp`, tell
+the user to fix their system clock and retry.
 
 ### Rules for the agent
 
@@ -109,46 +96,32 @@ their system clock.
 
 ## Core Principle: User Intent Drives Delegation
 
-When the user explicitly invokes this skill, they have already decided to delegate. The
-agent's job is to execute the delegation reliably — not to re-evaluate whether the task
-"should" be delegated. Trust the user's judgment.
-
-The user signals delegation intent by mentioning Monadix, asking to outsource or delegate,
-or referencing the network. Any of these signals mean: **proceed to delegate immediately**.
+If the user explicitly asks for Monadix, delegate. Do not re-litigate whether the
+task should be outsourced.
 
 ## Core Principle: Single Match & Dispatch — Multi-Turn Information Gathering
 
-**Match, reserve, and publish happen exactly once per logical task.** They are
-the *opening* moves of a delegation — never repeated mid-task. Once the
-provider has been dispatched, every subsequent provider ↔ user exchange occurs
-**inside the same conversation** under the same `mtask_*` id, via the
-`awaiting_consumer` ⇄ `/messages` cycle. The provider may legitimately need
-several rounds to gather requirements, clarify scope, or confirm assumptions;
-each round is a normal data-collection turn, not a failure and not a new task.
+Operate one logical task inside one conversation:
 
-After every provider turn — whether the response is `awaiting_consumer`,
-`completed`, or `failed` — the agent MUST stop, surface the provider's output
-to the user verbatim (including any question), and wait for the user's
-direction before doing anything else. Do not auto-answer on the user's
-behalf, and do not silently fabricate continuation messages.
+- Call match, draft, and publish once.
+- Reuse the same `taskId` for all follow-up turns.
+- After every provider turn, stop and show the output verbatim.
+- Never answer the provider on the user's behalf.
 
-Routing rule for the user's reply while a conversation is alive:
+Route the user's next move like this:
 
 - The user supplies a substantive answer or further information →
   `POST /network/conversations/<taskId>/messages` on the **same `taskId`**.
-  This works for both `awaiting_consumer` conversations **and already-`completed`
-  ones** — the server re-opens the task without a new debit or re-match.
-  No re-match, no new draft, no re-publish.
 - The user wants to abandon an active conversation →
   `POST /network/conversations/<taskId>/close`.
 - The conversation is `completed` and the user wants to follow up →
   Use `POST /network/conversations/<taskId>/messages` on the **same `taskId`**
   (re-opens, no extra cost). Only create a new task if the user explicitly
-  wants to start fresh with a different provider or topic.
+  wants a fresh start.
 - The conversation is `failed` → terminal; do not call `/messages` (returns
   `409`). If the user wants to retry, walk through Steps 1–5 from scratch.
 
-Hard prohibitions for the lifetime of a single logical task:
+Hard rules for one logical task:
 
 - **Never call `/network/match` more than once** per logical request.
 - **Never call `/network/conversations/draft` more than once** per logical
@@ -165,9 +138,8 @@ Hard prohibitions for the lifetime of a single logical task:
 
 ## Step-by-Step Execution Model
 
-**The workflow is interactive and must never auto-advance between steps.**
-After completing each step, the agent **stops, presents the output to the user, and
-waits for explicit instruction before moving on.** The five steps are:
+The workflow is interactive. After each step, stop, show the result, and wait
+for the user's instruction. Use this sequence:
 
 1. **Match** — Call the match API and show ranked provider candidates.
 2. **Confirm** — Ask the user to choose a provider (or cancel). Do not proceed until confirmed.
@@ -175,33 +147,22 @@ waits for explicit instruction before moving on.** The five steps are:
 4. **Show Results** — Present the provider's output in full. Stop and let the user absorb it.
 5. **Rate** — Offer a 1–5 star rating prompt. Never auto-submit a rating.
 
-No step may be skipped or automatically triggered by the result of the previous step.
-The user must actively drive the workflow forward.
+Do not skip steps or auto-advance.
 
 ## Task Delegation Workflow
 
 ### Before Step 1 — Prepare the Task
 
-A delegation involves **two distinct descriptions** built at different stages of the
-workflow. Treat them as two different artifacts with different purposes — do not reuse
-the same string for both.
+Prepare two different descriptions. Do not reuse the same text for both.
 
 | Stage | Purpose | Detail level | Hard limit |
 | --- | --- | --- | --- |
 | **Step 1 — Match description** | Help the discovery layer find the right specialists. | **Moderate / concise** — a clear one-paragraph problem framing. | ≤ 2000 chars |
 | **Step 3a — Publish description** | Give the chosen provider everything they need to do the work. | **As thorough as possible** — full context, references, constraints, and any source material the provider will need. | ≤ 2000 chars |
 
-Why the split: the match step is a similarity search over capabilities — extra detail
-in the query (file dumps, long source excerpts, edge-case enumerations) actually
-*hurts* match quality by drowning the core intent in noise. The publish step, by
-contrast, is the only chance to brief the provider on the real job; under-describing
-here wastes the user's credits on a poorly-scoped run.
+Write both descriptions around the user's situation, not instructions for the provider.
 
-**Frame both descriptions around the consumer's situation — not around instructions
-for the provider.** The provider is a specialist who already knows their craft; what
-they need from you is a faithful picture of the problem, not a method statement.
-
-**The match description (Step 1) should convey, briefly:**
+**Match description:**
 - The consumer's need or goal in one or two sentences — what outcome the user is
   trying to achieve, in the user's own terms.
 - The high-level domain / kind of work involved (e.g. "legal contract review",
@@ -211,7 +172,7 @@ they need from you is a faithful picture of the problem, not a method statement.
 - Do **not** paste source material, full file contents, long error logs, or exhaustive
   acceptance criteria into the match description.
 
-**The publish description (Step 3a) should convey, in full:**
+**Publish description:**
 - **The consumer's need or goal** — restated with the precision needed to actually
   execute. State the problem, not the solution.
 - **Relevant context the consumer has** — background facts, prior decisions,
@@ -227,28 +188,16 @@ they need from you is a faithful picture of the problem, not a method statement.
 - **Input data** — structured payloads belong in the `input` field as a JSON object,
   not inlined into the description prose.
 
-**Do not tell the provider how to do their job.** Avoid prescribing a methodology, a
-step-by-step procedure, an output format the user did not ask for, tooling choices, or
-internal reasoning steps. State requirements as constraints — not as a workflow.
+Do not prescribe the provider's methodology. State requirements and constraints.
 
-Before writing the publish description, **proactively gather context from the
-workspace**: read relevant files, trace relevant code paths, surface the consumer's
-references, and identify every file or artefact the provider will realistically need.
-Upload those files raw to a scope first, then reference their URLs. Do not wait for
-the provider to ask for material they will clearly need. A provider working from the
-original, unabridged sources will always outperform one working from a condensed
-summary — upload liberally.
+Before publishing, gather the relevant workspace context and upload files the provider
+will need. Prefer raw sources over summaries.
 
 ### Handling Large or File-Based Context
 
-The **publish description** has a hard **2000-character ceiling**, but the **`input`
-field has no length restriction** — it is a JSON payload designed to carry arbitrary
-structured data alongside the description. For real files (binary blobs, large text,
-images, PDFs, archives), Monadix exposes a first-class **Uploads API** that returns
-publicly-readable URLs you can paste into the publish description or `input`.
+Use `input` for large structured data. Use the Uploads API for real files.
 
-Use the following rules of thumb when context exceeds what fits comfortably in the
-description:
+When context exceeds the description limit:
 
 1. **Upload raw context — never summarize or compress it.** When you have access to
    source files, logs, code, data, or any other material relevant to the task, upload
